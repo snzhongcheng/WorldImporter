@@ -9,32 +9,53 @@
 std::unordered_map<std::pair<int, int>, std::vector<char>, pair_hash> regionCache(1024);
 
 // 根据配置的选择维度和存档路径，返回对应的 region 目录路径
+// 支持新版MC(1.21.4+)的 dimensions/<ns>/<dim>/region/ 结构,
+// 同时兼容旧版的 /region、/DIM-1/region、/DIM1/region 结构
 static std::string GetRegionDirectory() {
     const std::string& sel = config.selectedDimension;
     const std::string& base = config.worldPath;
-    std::string dir;
+
+    // 解析命名空间和维度名
+    std::string ns = "minecraft";
+    std::string dimName = "overworld";
     if (sel == "minecraft:overworld") {
-        dir = base + "/region";
+        // 默认值就是 overworld
     } else if (sel == "minecraft:the_nether") {
-        dir = base + "/DIM-1/region";
+        dimName = "the_nether";
     } else if (sel == "minecraft:the_end") {
-        dir = base + "/DIM1/region";
+        dimName = "the_end";
     } else {
         auto pos = sel.find(':');
-        if (pos == std::string::npos) {
-            dir = base + "/region";
-        } else {
-            std::string ns = sel.substr(0, pos);
-            std::string dimName = sel.substr(pos + 1);
-            dir = base + "/dimensions/" + ns + "/" + dimName + "/region";
+        if (pos != std::string::npos) {
+            ns = sel.substr(0, pos);
+            dimName = sel.substr(pos + 1);
         }
     }
-    if (!std::filesystem::exists(dir)) {
-        std::cerr << "警告: 维度目录不存在: " << dir << std::endl;
-        // 回退到主世界 region
-        return base + "/region";
+
+    // 旧版路径: overworld -> /region, the_nether -> /DIM-1/region, the_end -> /DIM1/region
+    // 新版路径: /dimensions/<ns>/<dimName>/region
+    std::string oldDir;
+    if (sel == "minecraft:overworld") {
+        oldDir = base + "/region";
+    } else if (sel == "minecraft:the_nether") {
+        oldDir = base + "/DIM-1/region";
+    } else if (sel == "minecraft:the_end") {
+        oldDir = base + "/DIM1/region";
+    } else {
+        oldDir = base + "/dimensions/" + ns + "/" + dimName + "/region";
     }
-    return dir;
+    std::string newDir = base + "/dimensions/" + ns + "/" + dimName + "/region";
+
+    // 优先尝试旧版路径(旧存档兼容),不存在则尝试新版路径
+    if (std::filesystem::exists(oldDir)) {
+        return oldDir;
+    }
+    if (std::filesystem::exists(newDir)) {
+        return newDir;
+    }
+    std::cerr << "警告: 维度目录不存在: " << oldDir << " 和 " << newDir << std::endl;
+    // 回退到旧版主世界 region(最可能存在)
+    return base + "/region";
 }
 
 //读取.mca文件到内存
