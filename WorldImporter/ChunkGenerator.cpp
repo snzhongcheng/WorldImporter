@@ -129,8 +129,10 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
 
     if (blockModel.vertices.empty()) return;
 
-    // 应用 OptiFine CTM 连接材质:根据邻居关系选择/合成连接贴图
-    if (HasCtmRules()) {
+    // Yuushya models already select connected geometry and fallback textures
+    // through block states, so preserve their pre-CTM import path.
+    bool useCtm = HasCtmRules() && ns != "yuushya";
+    if (useCtm) {
         ApplyCtmToBlockModel(blockModel, ns, blockName, x, y, z);
     }
 
@@ -146,7 +148,7 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
         curBaseName = curBaseName.substr(0, bracketPos);
     }
     auto isCtmConnected = [&](FaceType dir) -> bool {
-        if (!HasCtmRules()) return false;
+        if (!useCtm) return false;
         int nx = x, ny = y, nz = z;
         if (dir == FaceType::DOWN) ny--;
         else if (dir == FaceType::UP) ny++;
