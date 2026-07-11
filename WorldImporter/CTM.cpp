@@ -431,6 +431,56 @@ static bool LoadCtmTilePixels(const std::string& ns, const std::string& tileRelP
     return true;
 }
 
+static bool LoadTexturePixels(const std::string& ns, const std::string& texturePath,
+    std::vector<unsigned char>& outPixels, int& outW, int& outH) {
+    std::vector<unsigned char> pngData;
+    {
+        std::shared_lock<std::shared_mutex> lock(GlobalCache::cacheMutex);
+        auto indexIt = GlobalCache::textureIndex.find("textures:" + ns + ":" + texturePath);
+        if (indexIt == GlobalCache::textureIndex.end()) return false;
+        auto textureIt = GlobalCache::textures.find(indexIt->second);
+        if (textureIt == GlobalCache::textures.end()) return false;
+        pngData = textureIt->second;
+    }
+
+    int channels = 0;
+    unsigned char* pixels = stbi_load_from_memory(
+        pngData.data(), static_cast<int>(pngData.size()), &outW, &outH, &channels, 4);
+    if (!pixels || outW <= 0 || outH <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return false;
+    }
+    outPixels.assign(pixels, pixels + static_cast<size_t>(outW) * outH * 4);
+    stbi_image_free(pixels);
+    return true;
+}
+
+static bool GetMcmetaCtmTexture(const std::string& ns, const std::string& texturePath,
+    std::string& outNs, std::string& outPath) {
+    nlohmann::json metadata;
+    {
+        std::shared_lock<std::shared_mutex> lock(GlobalCache::cacheMutex);
+        auto indexIt = GlobalCache::mcmetaIndex.find("mcmetas:" + ns + ":" + texturePath);
+        if (indexIt == GlobalCache::mcmetaIndex.end()) return false;
+        auto metadataIt = GlobalCache::mcmetaCache.find(indexIt->second);
+        if (metadataIt == GlobalCache::mcmetaCache.end()) return false;
+        metadata = metadataIt->second;
+    }
+
+    if (!metadata.contains("ctm") || !metadata["ctm"].is_object()) return false;
+    const auto& ctm = metadata["ctm"];
+    if (ctm.value("ctm_version", 0) != 1 || ctm.value("type", "") != "CTM" ||
+        !ctm.contains("textures") || !ctm["textures"].is_array() || ctm["textures"].empty()) {
+        return false;
+    }
+
+    std::string texture = ctm["textures"][0].get<std::string>();
+    size_t colon = texture.find(':');
+    outNs = colon == std::string::npos ? ns : texture.substr(0, colon);
+    outPath = colon == std::string::npos ? texture : texture.substr(colon + 1);
+    return true;
+}
+
 // 确保目录存在(支持中文路径)
 static void EnsureDir(const std::string& path) {
     std::wstring wpath = string_to_wstring(path);
@@ -688,6 +738,105 @@ static CtmTexInfo GetOrCreateCompactTexInfo(const std::string& ns, const std::st
     return info;
 }
 
+static CtmTexInfo GetOrCreateMcmetaCtmTexInfo(const std::string& ns,
+    const std::string& texturePath, const std::string& ctmNs, const std::string& ctmPath,
+    const FaceLayout& layout, int x, int y, int z, const std::string& curBaseName) {
+    const std::array<int, 3>* edges[4] = {
+        &layout.down, &layout.right, &layout.up, &layout.left
+    };
+    const std::array<int, 3>* corners[4] = {
+        &layout.downLeft, &layout.downRight, &layout.upRight, &layout.upLeft
+    };
+    const int offsets[4] = { 4, 5, 1, 0 };
+    int submaps[4] = { 18, 19, 17, 16 }; // Bottom-left, bottom-right, top-right, top-left.
+
+    for (int i = 0; i < 4; ++i) {
+        const auto& first = *edges[i];
+        const auto& second = *edges[(i + 3) % 4];
+        const auto& corner = *corners[i];
+        bool firstConnected = IsConnected(x, y, z, first[0], first[1], first[2], curBaseName);
+        bool secondConnected = IsConnected(x, y, z, second[0], second[1], second[2], curBaseName);
+        if (firstConnected || secondConnected) {
+            bool cornerConnected = IsConnected(x, y, z, corner[0], corner[1], corner[2], curBaseName);
+            if (firstConnected && secondConnected && cornerConnected) {
+                submaps[i] = offsets[i];
+            }
+            else {
+                submaps[i] = offsets[i] + (firstConnected ? 2 : 0) + (secondConnected ? 8 : 0);
+            }
+        }
+    }
+
+    std::string signature = std::to_string(submaps[0]) + "_" + std::to_string(submaps[1]) +
+        "_" + std::to_string(submaps[2]) + "_" + std::to_string(submaps[3]);
+    std::string baseDir = "mcmeta/" + texturePath;
+    std::string cacheId = ns + "|" + baseDir + "|" + signature;
+    {
+        std::lock_guard<std::mutex> lock(g_ctmTexCacheMutex);
+        auto it = g_ctmTexCache.find(cacheId);
+        if (it != g_ctmTexCache.end()) return it->second;
+    }
+
+    CtmTexInfo info;
+    info.materialName = BuildCtmMaterialName(ns, baseDir, signature);
+    info.texturePath = BuildCtmTextureRelPath(ns, baseDir, signature);
+
+    std::lock_guard<std::mutex> pngLock(g_ctmPngMutex);
+    {
+        std::lock_guard<std::mutex> lock(g_ctmTexCacheMutex);
+        auto it = g_ctmTexCache.find(cacheId);
+        if (it != g_ctmTexCache.end()) return it->second;
+    }
+
+    std::vector<unsigned char> basePixels, ctmPixels;
+    int baseW = 0, baseH = 0, ctmW = 0, ctmH = 0;
+    if (!LoadTexturePixels(ns, texturePath, basePixels, baseW, baseH) ||
+        !LoadTexturePixels(ctmNs, ctmPath, ctmPixels, ctmW, ctmH) ||
+        baseW != baseH || ctmW != ctmH || ctmW != baseW * 2) {
+        return info;
+    }
+
+    int half = baseW / 2;
+    std::vector<unsigned char> output(static_cast<size_t>(baseW) * baseH * 4);
+    const int destinationX[4] = { 0, half, half, 0 };
+    const int destinationY[4] = { half, half, 0, 0 };
+    for (int quadrant = 0; quadrant < 4; ++quadrant) {
+        int submap = submaps[quadrant];
+        const std::vector<unsigned char>* source = nullptr;
+        int sourceWidth = 0, sourceX = 0, sourceY = 0;
+        if (submap >= 16) {
+            source = &basePixels;
+            sourceWidth = baseW;
+            int baseQuadrant = submap - 16;
+            sourceX = (baseQuadrant % 2) * half;
+            sourceY = (baseQuadrant / 2) * half;
+        }
+        else {
+            source = &ctmPixels;
+            sourceWidth = ctmW;
+            sourceX = (submap % 4) * half;
+            sourceY = (submap / 4) * half;
+        }
+
+        for (int yy = 0; yy < half; ++yy) {
+            for (int xx = 0; xx < half; ++xx) {
+                size_t src = (static_cast<size_t>(sourceY + yy) * sourceWidth + sourceX + xx) * 4;
+                size_t dst = (static_cast<size_t>(destinationY[quadrant] + yy) * baseW +
+                    destinationX[quadrant] + xx) * 4;
+                std::copy_n(source->data() + src, 4, output.data() + dst);
+            }
+        }
+    }
+
+    std::string fullPath = BuildCtmTextureFilePath(ns, baseDir, signature);
+    info.saved = stbi_write_png(fullPath.c_str(), baseW, baseH, 4, output.data(), baseW * 4) != 0;
+    if (info.saved) {
+        std::lock_guard<std::mutex> lock(g_ctmTexCacheMutex);
+        g_ctmTexCache[cacheId] = info;
+    }
+    return info;
+}
+
 // ========= horizontal / vertical =========
 // horizontal: 按左右连接选 4 tile(0=无连接,1=左,2=右,3=左右都有)
 static int SelectHorizontalTile(const FaceLayout& L, int x, int y, int z, const std::string& curBaseName) {
@@ -800,9 +949,6 @@ void ApplyCtmToBlockModel(ModelData& model,
             textureName = pathPart;
         }
 
-        const CtmRule* rule = FindCtmRule(matNs, baseBlockName, textureName);
-        if (!rule) continue;
-
         // 确定面朝向
         FaceType ft = face.faceDirection;
         if (ft == FaceType::DO_NOT_CULL || ft == FaceType::UNKNOWN) {
@@ -810,13 +956,13 @@ void ApplyCtmToBlockModel(ModelData& model,
             if (ft == FaceType::DO_NOT_CULL) continue; // 无法判断方向,跳过
         }
         const char* ftn = FaceTypeName(ft);
-        if (!CtmRuleMatchesFace(*rule, ftn)) continue;
-
         FaceLayout L = GetFaceLayout(ft);
 
         CtmTexInfo info;
         bool got = false;
-        switch (rule->method) {
+        const CtmRule* rule = FindCtmRule(matNs, baseBlockName, textureName);
+        if (rule && !CtmRuleMatchesFace(*rule, ftn)) continue;
+        switch (rule ? rule->method : CtmMethod::None) {
         case CtmMethod::CtmCompact:
             info = GetOrCreateCompactTexInfo(rule->ns, rule->baseDir, L, x, y, z, curBaseName, *rule);
             got = true;
@@ -848,6 +994,15 @@ void ApplyCtmToBlockModel(ModelData& model,
         default:
             // Random/Overlay/Repeat 第一阶段不处理
             break;
+        }
+
+        if (!got) {
+            std::string ctmNs, ctmPath;
+            if (GetMcmetaCtmTexture(matNs, textureName, ctmNs, ctmPath)) {
+                info = GetOrCreateMcmetaCtmTexInfo(
+                    matNs, textureName, ctmNs, ctmPath, L, x, y, z, curBaseName);
+                got = info.saved;
+            }
         }
 
         if (got) {
