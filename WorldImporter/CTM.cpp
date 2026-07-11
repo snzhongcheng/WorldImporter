@@ -741,8 +741,11 @@ static CtmTexInfo GetOrCreateCompactTexInfo(const std::string& ns, const std::st
 static CtmTexInfo GetOrCreateMcmetaCtmTexInfo(const std::string& ns,
     const std::string& texturePath, const std::string& ctmNs, const std::string& ctmPath,
     const FaceLayout& layout, int x, int y, int z, const std::string& curBaseName) {
-    const std::array<int, 3>* edges[4] = {
-        &layout.down, &layout.right, &layout.up, &layout.left
+    const std::array<int, 3>* firstEdges[4] = {
+        &layout.down, &layout.down, &layout.up, &layout.up
+    };
+    const std::array<int, 3>* secondEdges[4] = {
+        &layout.left, &layout.right, &layout.right, &layout.left
     };
     const std::array<int, 3>* corners[4] = {
         &layout.downLeft, &layout.downRight, &layout.upRight, &layout.upLeft
@@ -751,8 +754,8 @@ static CtmTexInfo GetOrCreateMcmetaCtmTexInfo(const std::string& ns,
     int submaps[4] = { 18, 19, 17, 16 }; // Bottom-left, bottom-right, top-right, top-left.
 
     for (int i = 0; i < 4; ++i) {
-        const auto& first = *edges[i];
-        const auto& second = *edges[(i + 3) % 4];
+        const auto& first = *firstEdges[i];
+        const auto& second = *secondEdges[i];
         const auto& corner = *corners[i];
         bool firstConnected = IsConnected(x, y, z, first[0], first[1], first[2], curBaseName);
         bool secondConnected = IsConnected(x, y, z, second[0], second[1], second[2], curBaseName);
