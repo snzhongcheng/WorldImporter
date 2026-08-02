@@ -47,12 +47,15 @@ extern std::unordered_map<std::pair<int, int>, std::vector<std::shared_ptr<Entit
 extern std::unordered_map<std::pair<int, int>, std::unordered_map<std::string, std::vector<int>>, pair_hash> heightMapCache;
 extern std::unordered_map<std::tuple<int, int, int>, SectionCacheEntry, triple_hash> sectionCache;
 
+NbtTagPtr GetBlockEntityNbt(int blockX, int blockY, int blockZ);
+
 struct Block {
     std::string name;
+    std::string fluidName;
     int8_t level;
     bool air;
 
-    Block(const std::string& name) : name(name), level(-1), air(true) {
+    Block(const std::string& name) : name(name), fluidName(""), level(-1), air(true) {
         // 用 string_view 减少 substr 拷贝,仅对 baseName 做一次 std::string 构造
         std::string_view fullName(name);
         size_t bracketPos = fullName.find('[');
@@ -91,6 +94,7 @@ struct Block {
             for (const auto& fluidEntry : fluidDefinitions) {
                 const FluidInfo& info = fluidEntry.second;
                 if (info.liquid_blocks.count(baseName)) {
+                    fluidName = fluidEntry.first;
                     level = 0;
                     fluidProcessed = true;
                     break;
@@ -99,12 +103,12 @@ struct Block {
         }
         // 阶段2:检查流体属性(如waterlogged)
         for (const auto& fluidEntry : fluidDefinitions) {
-            const std::string& fluidName = fluidEntry.first;
             const FluidInfo& info = fluidEntry.second;
 
             if (!info.property.empty() &&
                 states.count(info.property) &&
                 states[info.property] == "true") {
+                if (fluidName.empty()) fluidName = fluidEntry.first;
                 level = 0;
                 fluidProcessed = true;
                 break;
@@ -118,6 +122,7 @@ struct Block {
             const auto& it = fluidDefinitions.find(baseName);
             if (it != fluidDefinitions.end()) {
                 const FluidInfo& info = it->second;
+                fluidName = it->first;
                 std::string levelProp = info.level_property.empty() ?
                     "level" : info.level_property;
 
@@ -137,7 +142,7 @@ struct Block {
 
 
     }
-    Block(const std::string& name, bool air) : name(name), level(-1), air(air) {}
+    Block(const std::string& name, bool air) : name(name), fluidName(""), level(-1), air(air) {}
 
     // 方法:获取命名空间部分
     std::string GetNamespace() const {
@@ -160,6 +165,14 @@ struct Block {
 
         // 如果有方括号,返回方括号之前的部分
         return name.substr(0, bracketPos);
+    }
+
+    bool HasFluid() const {
+        return level >= 0 && !fluidName.empty();
+    }
+
+    bool IsPureFluid() const {
+        return HasFluid() && GetNameAndNameSpaceWithoutState() == fluidName;
     }
     // 保留命名空间和基础名字,只处理状态键值对
     std::string GetModifiedNameWithNamespace() const {
@@ -437,7 +450,7 @@ int GetSkyLight(int blockX, int blockY, int blockZ);
 
 int GetBlockLight(int blockX, int blockY, int blockZ);
 
-int GetLevel(int blockX, int blockY, int blockZ);
+int GetLevel(int blockX, int blockY, int blockZ, const std::string& fluidName = "");
 
 int GetHeightMapY(int blockX, int blockZ, const std::string& heightMapType);
 

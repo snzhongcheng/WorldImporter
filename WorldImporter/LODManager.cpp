@@ -97,9 +97,9 @@ std::string GetBlockAverageColor(int blockId, Block currentBlock, int x, int y, 
         blockName = blockName.substr(colonPos + 1);
     }
     ModelData blockModel;
-    bool isFluid = (fluidDefinitions.find(currentBlock.GetNameAndNameSpaceWithoutState()) != fluidDefinitions.end());
-    if (isFluid && currentBlock.level > -1) {
-        AssignFluidMaterials(blockModel, currentBlock.name);
+    bool isFluid = currentBlock.IsPureFluid();
+    if (isFluid) {
+        AssignFluidMaterials(blockModel, currentBlock.fluidName);
     }
     else {
         blockModel = GetRandomModelFromCache(ns, blockName);
@@ -235,7 +235,7 @@ std::string GetBlockAverageColor(int blockId, Block currentBlock, int x, int y, 
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(config.decimalPlaces);
         if (isFluid) {
-            oss << "color#" << finalR << " " << finalG << " " << finalB << "-" << currentBlock.GetNameAndNameSpaceWithoutState().c_str();
+            oss << "color#" << finalR << " " << finalG << " " << finalB << "-" << currentBlock.fluidName;
         }
         else {
             oss << "color#" << finalR << " " << finalG << " " << finalB << "=";
@@ -244,7 +244,7 @@ std::string GetBlockAverageColor(int blockId, Block currentBlock, int x, int y, 
     }
     else {
         if (isFluid) {
-            return  + "color#" + textureAverage + "-" + currentBlock.GetNameAndNameSpaceWithoutState();
+            return "color#" + textureAverage + "-" + currentBlock.fluidName;
         }
         else {
             return "color#" + textureAverage + "=";
@@ -271,7 +271,7 @@ BlockType GetBlockType(int x, int y, int z) {
     if (currentBlock.name == "minecraft:air") {
         return AIR;
     }
-    else if (currentBlock.level > -1) {
+    else if (currentBlock.IsPureFluid()) {
         return FLUID;
     }
     else {
@@ -283,11 +283,11 @@ BlockType GetBlockType2(int x, int y, int z) {
     int currentId = GetBlockId(x, y, z);
     Block currentBlock = GetBlockById(currentId);
 
-    if (!currentBlock.air && currentBlock.level == -1) {
-        return SOLID;
-    }
-    else if (currentBlock.level > -1) {
+    if (currentBlock.IsPureFluid()) {
         return FLUID;
+    }
+    else if (!currentBlock.air) {
+        return SOLID;
     }
     else
     {
@@ -444,9 +444,9 @@ bool IsRegionEmpty(int x, int y, int z, float lodSize) {
 // 辅助函数:判断指定区域是否有效 
 bool IsRegionValid(int x, int y, int z, float lodSize) {
     // 边界检查
-    if (x < config.minX || x + lodSize > config.maxX ||
-        z < config.minZ || z + lodSize > config.maxZ ||
-        y < config.minY || y + lodSize > config.maxY) {
+    if (x < config.minX || x + lodSize - 1 > config.maxX ||
+        z < config.minZ || z + lodSize - 1 > config.maxZ ||
+        y < config.minY || y + lodSize - 1 > config.maxY) {
         if (config.keepBoundary)
             return false;
         return true;
@@ -469,9 +469,9 @@ bool IsFluidRegionEmpty(int x, int y, int z, float lodSize, float h) {
 // 辅助函数:判断指定区域是否有效 
 bool IsFluidRegionValid(int x, int y, int z, float lodSize, float h) {
     // 边界检查
-    if (x < config.minX || x + lodSize > config.maxX ||
-        z < config.minZ || z + lodSize > config.maxZ ||
-        y < config.minY || y + lodSize > config.maxY) {
+    if (x < config.minX || x + lodSize - 1 > config.maxX ||
+        z < config.minZ || z + lodSize - 1 > config.maxZ ||
+        y < config.minY || y + lodSize - 1 > config.maxY) {
         if (config.keepBoundary)
             return false;
         return true;
@@ -493,9 +493,9 @@ bool IsFluidTopRegionEmpty(int x, int y, int z, float lodSize, float h) {
 // 辅助函数:判断指定区域是否有效 
 bool IsFluidTopRegionValid(int x, int y, int z, float lodSize, float h) {
     // 边界检查
-    if (x < config.minX || x + lodSize > config.maxX ||
-        z < config.minZ || z + lodSize > config.maxZ ||
-        y < config.minY || y + lodSize > config.maxY) {
+    if (x < config.minX || x + lodSize - 1 > config.maxX ||
+        z < config.minZ || z + lodSize - 1 > config.maxZ ||
+        y < config.minY || y + lodSize - 1 > config.maxY) {
         if (config.keepBoundary)
             return false;
         return true;

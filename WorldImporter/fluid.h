@@ -21,6 +21,8 @@ struct FluidInfo {
 // 全局流体定义数据
 extern std::unordered_map<std::string, FluidInfo> fluidDefinitions;
 
+constexpr int FULL_FLUID_LEVEL = 16;
+
 // 获取流体高度的函数
 float getHeight(int level);
 

@@ -74,11 +74,12 @@ void LoadFluidBlocks(const std::string& filepath) {
             if (entry.is_string()) {
                 std::string name = entry.get<std::string>();
                 fluidDefinitions[name] = {
-                    "block"
-                    "",       // 默认无属性
-                    "level",  // 默认level属性
-                    {},      // 空列表
-                    
+                    "block",
+                    "_still",
+                    "_flow",
+                    "",
+                    "level",
+                    {}
                 };
                 continue;
             }

@@ -13,24 +13,25 @@ using namespace std;
 // 流体注册数据
 std::unordered_map<std::string, FluidInfo> fluidDefinitions;
 // 模型缓存
-static std::unordered_map<int, ModelData> fluidModelCache;
+static std::unordered_map<size_t, ModelData> fluidModelCache;
 static std::mutex fluidModelCacheMutex; 
 
 float getHeight(int level) {
-    if (level == 0)
-        return 14.166666f; // 水源
-
     if (level == -1)
         return 0.0f; // 空气
 
     if (level == -2)
         return -1.0f; // 一般方块
 
-    if (level == 8)
-        return 16.0f; // 流动水
+    if (level == FULL_FLUID_LEVEL)
+        return 16.0f; // 上方存在同种流体
 
-    // 中间值的线性插值计算
-    return 2.0f + (12.0f / 7.0f) * (7 - level);
+    // 8..15 are falling variants of levels 0..7 in the saved block state.
+    if (level >= 8 && level <= 15)
+        level -= 8;
+
+    level = std::clamp(level, 0, 7);
+    return (8.0f - static_cast<float>(level)) * (16.0f / 9.0f);
 }
 
 float getCornerHeight(float currentHeight, float NWHeight, float NHeight, float WHeight) {
@@ -42,22 +43,30 @@ float getCornerHeight(float currentHeight, float NWHeight, float NHeight, float 
         return 16.0f;
     }
 
-    if (currentHeight == 14.166666f) {
+    // 与不透明方块(固体,高度为-2)相邻的角落升到满高。
+    // MC 原版中水贴住方块时水面会爬到方块顶部,若不抬升,
+    // 方块底面/侧面与水面之间会留下约 0.11 格的空气缝隙。
+    if (NWHeight == -1.0f || NHeight == -1.0f || WHeight == -1.0f) {
+        return 16.0f;
+    }
+
+    constexpr float sourceHeight = 128.0f / 9.0f;
+    if (std::fabs(currentHeight - sourceHeight) < 1e-5f) {
         res += currentHeight * 11.0f;
         totalWeight += 11.0f;
         sourceBlock = true;
     }
-    if (NWHeight == 14.166666f) {
+    if (std::fabs(NWHeight - sourceHeight) < 1e-5f) {
         res += NWHeight * 12.0f;
         totalWeight += 12.0f;
         sourceBlock = true;
     }
-    if (NHeight == 14.166666f) {
+    if (std::fabs(NHeight - sourceHeight) < 1e-5f) {
         res += NHeight * 12.0f;
         totalWeight += 12.0f;
         sourceBlock = true;
     }
-    if (WHeight == 14.166666f) {
+    if (std::fabs(WHeight - sourceHeight) < 1e-5f) {
         res += WHeight * 12.0f;
         totalWeight += 12.0f;
         sourceBlock = true;
@@ -114,12 +123,10 @@ ModelData GenerateFluidModel(const std::array<int, 10>& fluidLevels, const std::
     int southwestLevel = fluidLevels[8]; // 西南
     int aboveLevel = fluidLevels[9];     // 上方
 
-    size_t key = 0;
+    size_t key = std::hash<std::string>{}(fluidId);
     for (int level : fluidLevels) {
-        key = (key << 3) ^ (level + (level << 5));
+        key ^= std::hash<int>{}(level) + 0x9e3779b9 + (key << 6) + (key >> 2);
     }
-    // 结合流体ID，确保不同流体类型有不同的缓存键值
-    key = key ^ std::hash<std::string>{}(fluidId);
 
     // Lock the mutex to safely access the cache
     std::lock_guard<std::mutex> lock(fluidModelCacheMutex);
@@ -140,14 +147,18 @@ ModelData GenerateFluidModel(const std::array<int, 10>& fluidLevels, const std::
     float southwestHeight = getHeight(southwestLevel);
 
     // 计算四个上顶点的高度
-    float h_nw = getCornerHeight(currentHeight, northwestHeight, northHeight, westHeight) / 16.0f;
-    float h_ne = getCornerHeight(currentHeight, northeastHeight, northHeight, eastHeight) / 16.0f;
-    float h_se = getCornerHeight(currentHeight, southeastHeight, southHeight, eastHeight) / 16.0f;
-    float h_sw = getCornerHeight(currentHeight, southwestHeight, southHeight, westHeight) / 16.0f;
-    h_nw = ceil(h_nw * 10.0f) / 10.0f;
-    h_ne = ceil(h_ne * 10.0f) / 10.0f;
-    h_se = ceil(h_se * 10.0f) / 10.0f;
-    h_sw = ceil(h_sw * 10.0f) / 10.0f;
+    // �����ĸ��϶���ĸ߶�
+    // If the block above is solid(-2), raise water surface to full height
+    // so it touches the bottom of the solid block, avoiding an air gap.
+    float h_nw, h_ne, h_se, h_sw;
+    if (aboveLevel == -2) {
+        h_nw = h_ne = h_se = h_sw = 1.0f;
+    } else {
+        h_nw = getCornerHeight(currentHeight, northwestHeight, northHeight, westHeight) / 16.0f;
+        h_ne = getCornerHeight(currentHeight, northeastHeight, northHeight, eastHeight) / 16.0f;
+        h_se = getCornerHeight(currentHeight, southeastHeight, southHeight, eastHeight) / 16.0f;
+        h_sw = getCornerHeight(currentHeight, southwestHeight, southHeight, westHeight) / 16.0f;
+    }
 
     model.vertices = {
         // 底面 (bottom) - Y轴负方向
@@ -200,7 +211,7 @@ ModelData GenerateFluidModel(const std::array<int, 10>& fluidLevels, const std::
     model.faces[1].vertexIndices = { 4, 7, 6, 5 };
     model.faces[1].uvIndices = { 4, 7, 6, 5 };
     // 根据上方方块决定顶面是否剔除
-    model.faces[1].faceDirection = (aboveLevel < 0) ? DO_NOT_CULL : UP;
+    model.faces[1].faceDirection = (aboveLevel == -1) ? DO_NOT_CULL : UP;
     model.faces[1].materialIndex = 1; // flow材质
     
     // 北面 (z-)
@@ -294,7 +305,7 @@ ModelData GenerateFluidModel(const std::array<int, 10>& fluidLevels, const std::
         0.0f, 0.0f + temp_offset, 1.0f, 0.0f + temp_offset, 1.0f, v_se, 0.0f, v_ne
     };
 
-    if (currentLevel == 0 || currentLevel == 8) {
+    if (currentLevel == 0 || currentLevel == FULL_FLUID_LEVEL) {
         model.uvCoordinates = {
             // 下面(使用静止贴图的长宽比)
             0.0f, 1.0f, 1.0f, 1.0f, 1.0f, still_bottom_v, 0.0f, still_bottom_v,
@@ -337,8 +348,8 @@ ModelData GenerateFluidModel(const std::array<int, 10>& fluidLevels, const std::
     else {
         // 使用和MC一致的流向计算方法
         // 计算X方向和Z方向梯度
-        float gradientX = (h_ne + h_se - h_nw - h_sw) * 0.5f;
-        float gradientZ = (h_sw + h_se - h_nw - h_ne) * 0.5f;
+        float gradientX = (h_nw + h_sw - h_ne - h_se) * 0.5f;
+        float gradientZ = (h_nw + h_ne - h_sw - h_se) * 0.5f;
 
         // 计算流向角度 (使用和MC类似的方法)
         float angle = atan2(gradientZ, gradientX) - (M_PI / 2.0f); // 注意这里减去PI/2

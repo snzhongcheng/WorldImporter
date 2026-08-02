@@ -24,11 +24,10 @@
 #include <utility>
 #include "hashutils.h"
 #include "ChunkLoader.h"
+#include "SpecialBlock.h"
 using namespace std;
 using namespace std::chrono;
 
-std::unordered_set<std::pair<int, int>, pair_hash> processedChunks;
-std::mutex entityCacheMutex; // 互斥量,确保线程安全
 static const std::unordered_map<FaceType, int> neighborIndexMap = {
         {FaceType::DOWN, 1}, {FaceType::UP, 0}, {FaceType::NORTH, 4},
         {FaceType::SOUTH, 5}, {FaceType::WEST, 2}, {FaceType::EAST, 3}
@@ -137,18 +136,24 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
 
     ModelData blockModel;
     ModelData liquidModel;
-    if (currentBlock.level > -1) {
+    bool specialHandled = SpecialBlock::TryGenerateCreateBlockModel(
+        currentBlock.GetModifiedNameWithNamespace(), x, y, z,
+        GetBlockEntityNbt(x, y, z), blockModel);
+    if (specialHandled) {
+        for (auto& face : blockModel.faces) face.faceDirection = FaceType::DO_NOT_CULL;
+    }
+    else if (currentBlock.HasFluid()) {
         blockModel = GetRandomModelFromCache(ns, blockName);
 
         if (blockModel.vertices.empty()) {
-            liquidModel = GenerateFluidModel(fluidLevels, currentBlock.name);
-            AssignFluidMaterials(liquidModel, currentBlock.name);
+            liquidModel = GenerateFluidModel(fluidLevels, currentBlock.fluidName);
+            AssignFluidMaterials(liquidModel, currentBlock.fluidName);
             blockModel = liquidModel;
         }
         else
         {
-            liquidModel = GenerateFluidModel(fluidLevels, "minecraft:water[level:0]");
-            AssignFluidMaterials(liquidModel, "minecraft:water[level:0]");
+            liquidModel = GenerateFluidModel(fluidLevels, currentBlock.fluidName);
+            AssignFluidMaterials(liquidModel, currentBlock.fluidName);
 
             // 只对有流体方向的面设置为不剔除
             for (auto& face : blockModel.faces)
@@ -170,7 +175,7 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
                         int neighborId = GetBlockId(nx, ny, nz);
                         Block neighborBlock = GetBlockById(neighborId);
                         // 如果邻居是流体或含有流体，则不剔除
-                        if (neighborBlock.level > -1) {
+                        if (neighborBlock.HasFluid()) {
                             face.faceDirection = FaceType::DO_NOT_CULL;
                         }
                     }
@@ -190,7 +195,7 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
 
     // Preserve Yuushya's block-state geometry for partial blocks, while full
     // cubes still use their CTM rules like other blocks.
-    bool useCtm = HasCtmRules() && (ns != "yuushya" || IsFullCubeModel(blockModel));
+    bool useCtm = !specialHandled && HasCtmRules() && ns != "create" && (ns != "yuushya" || IsFullCubeModel(blockModel));
     if (useCtm) {
         ApplyCtmToBlockModel(blockModel, ns, blockName, x, y, z);
     }
@@ -308,34 +313,36 @@ ModelData ChunkGenerator::GenerateChunkModel(int chunkX, int sectionY, int chunk
     }
 
     
+    // 方块实体只在其基准坐标所属的 Section 中生成，并严格遵守导出范围。
+    // 旧逻辑会由当前区块第一个完成的 Section 导出全部实体，导致范围外的
+    // 模组方块泄漏到结果中，同时让导出结果受线程调度影响。
     auto chunkKey = std::make_pair(chunkX, chunkZ);
-    {
-        std::lock_guard<std::mutex> lock(entityCacheMutex);
-        if (processedChunks.find(chunkKey) != processedChunks.end()) {
-            return chunkModel;
-        }
-    }
-
-    if (EntityBlockCache.find(chunkKey) != EntityBlockCache.end()) {
-        const auto& entityBlocks = EntityBlockCache[chunkKey];
+    auto entityIt = EntityBlockCache.find(chunkKey);
+    if (entityIt != EntityBlockCache.end()) {
+        const auto& entityBlocks = entityIt->second;
         for (const auto& entity : entityBlocks) {
-            ModelData EntityModel;
-            if (entity != nullptr) {
-                EntityModel = entity->GenerateModel();
-                if (chunkModel.vertices.empty()) {
-                    chunkModel = EntityModel;
-                }
-                else {
-                    MergeModelsDirectly(chunkModel, EntityModel);
-                }
+            if (entity == nullptr) continue;
+            if (entity->x < xStart || entity->x > xEnd ||
+                entity->y < yStart || entity->y > yEnd ||
+                entity->z < zStart || entity->z > zEnd) {
+                continue;
+            }
+
+            int entitySectionY;
+            blockYToSectionY(entity->y, entitySectionY);
+            if (entitySectionY != sectionY) continue;
+
+            ModelData entityModel = entity->GenerateModel();
+            if (entityModel.vertices.empty()) continue;
+            if (chunkModel.vertices.empty()) {
+                chunkModel = std::move(entityModel);
+            }
+            else {
+                MergeModelsDirectly(chunkModel, entityModel);
             }
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(entityCacheMutex);
-        processedChunks.insert(chunkKey);
-    }
     return chunkModel;
 }
 
@@ -359,9 +366,9 @@ ModelData ChunkGenerator::GenerateLODChunkModel(int chunkX, int sectionY, int ch
         for (int z = blockZStart; z < blockZStart + 16; z += lodBlockSize) {
             for (int y = blockYStart; y < blockYStart + 16; y += lodBlockSize) {
                 // 边界检查
-                if (x < xStart || x + lodBlockSize > xEnd ||
-                    z < zStart || z + lodBlockSize > zEnd ||
-                    y < yStart || y + lodBlockSize > yEnd)
+                if (x < xStart || x + lodBlockSize - 1 > xEnd ||
+                    z < zStart || z + lodBlockSize - 1 > zEnd ||
+                    y < yStart || y + lodBlockSize - 1 > yEnd)
                     continue;
 
                 if (config.cullCave) {
@@ -376,6 +383,11 @@ ModelData ChunkGenerator::GenerateLODChunkModel(int chunkX, int sectionY, int ch
                 if (id != -1) {
                     Block currentBlock = GetBlockById(id);
                     std::string blockName = currentBlock.GetModifiedNameWithNamespace();
+
+                    if (lodBlockSize == 1 && currentBlock.HasFluid() && !currentBlock.IsPureFluid()) {
+                        ProcessBlockForModel(chunkModel, x, y, z);
+                        continue;
+                    }
                     
                     // 仅在LOD级别为1时启用原始模型功能
                     if (lodBlockSize == 1 && LODManager::ShouldUseOriginalModel(blockName)) {

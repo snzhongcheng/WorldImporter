@@ -721,6 +721,7 @@ void processElements(const nlohmann::json& modelJson, ModelData& data,
     int faceId = 0;
     short tintindex = -1;
     std::unordered_map<std::string, int> faceCountMap; // 面计数映射
+    std::unordered_map<std::string, std::unordered_set<int>> faceMaterialMap;
 
     auto elements = modelJson["elements"];
 
@@ -912,33 +913,27 @@ void processElements(const nlohmann::json& modelJson, ModelData& data,
                     return true;
                 };
 
-            // 用于记录需要覆盖 uv 的信息
             std::vector<std::string> facesToRemove;
-            // 创建映射,记录哪个面被哪个面替代,键是被移除的面名称,值是保留的面名称
             std::unordered_map<std::string, std::string> faceReplacementMap;
-            
+
             for (const auto& faceEntry : elementVertices) {
                 const std::string& faceName = faceEntry.first;
                 std::string opposite = getOppositeFace(faceName);
                 auto oppositeIt = elementVertices.find(opposite);
 
-                // 反向面存在且重叠时才移除
-                if (oppositeIt != elementVertices.end()) {
-                    if (areFacesCoinciding(faceEntry.second, oppositeIt->second)) {
-                        // 根据 faceName 判断移除哪一面
-                        if (faceName == "south" || faceName == "west" || faceName == "down") {
-                            facesToRemove.push_back(faceName);
-                            faceReplacementMap[faceName] = opposite; // 记录面替换关系
-                        }
-                        else {
-                            facesToRemove.push_back(opposite);
-                            faceReplacementMap[opposite] = faceName; // 记录面替换关系
-                        }
+                if (oppositeIt != elementVertices.end() &&
+                    areFacesCoinciding(faceEntry.second, oppositeIt->second)) {
+                    if (faceName == "south" || faceName == "west" || faceName == "down") {
+                        facesToRemove.push_back(faceName);
+                        faceReplacementMap[faceName] = opposite;
+                    }
+                    else {
+                        facesToRemove.push_back(opposite);
+                        faceReplacementMap[opposite] = faceName;
                     }
                 }
             }
 
-            // 去重并移除面
             std::sort(facesToRemove.begin(), facesToRemove.end());
             auto last = std::unique(facesToRemove.begin(), facesToRemove.end());
             facesToRemove.erase(last, facesToRemove.end());
@@ -1015,8 +1010,22 @@ void processElements(const nlohmann::json& modelJson, ModelData& data,
                             << vertexFingerprint;
                         std::string key = keyStream.str();
 
+                        int currentMaterialIndex = -1;
+                        if (face.value().contains("texture")) {
+                            std::string texture = face.value()["texture"];
+                            if (!texture.empty() && texture.front() == '#') texture.erase(0, 1);
+                            auto materialIt = textureKeyToMaterialIndex.find(texture);
+                            if (materialIt != textureKeyToMaterialIndex.end()) {
+                                currentMaterialIndex = materialIt->second;
+                            }
+                        }
+
                         bool skipFace = false;
-                        if (config.allowDoubleFace) {
+                        auto& seenMaterials = faceMaterialMap[key];
+                        bool isLayeredMaterial = !seenMaterials.empty() &&
+                            !seenMaterials.contains(currentMaterialIndex);
+
+                        if (config.allowDoubleFace || isLayeredMaterial) {
                             int count = ++faceCountMap[key];
                             float offset = (count - 1) * 0.001f;
                             for (auto& v : faceVertices) {
@@ -1030,6 +1039,8 @@ void processElements(const nlohmann::json& modelJson, ModelData& data,
                                 skipFace = true;
                             }
                         }
+
+                        seenMaterials.insert(currentMaterialIndex);
 
                         if (skipFace) {
                             continue;
@@ -1764,6 +1775,21 @@ ModelData MergeFluidModelData(const ModelData& data1, const ModelData& data2) {
         for (size_t i = 0; i < static_cast<size_t>(mesh1FaceCount); i++) {
             const auto& faceIndices1 = mergedData.faces[i].vertexIndices;
             auto normal = computeNormal(mergedData.vertices, faceIndices1);
+            const int planeVertex = faceIndices1[0];
+            const float planeX = mergedData.vertices[planeVertex * 3];
+            const float planeY = mergedData.vertices[planeVertex * 3 + 1];
+            const float planeZ = mergedData.vertices[planeVertex * 3 + 2];
+            bool coplanar = true;
+            for (int idx : faceIndices2) {
+                const float dx = mergedData.vertices[idx * 3] - planeX;
+                const float dy = mergedData.vertices[idx * 3 + 1] - planeY;
+                const float dz = mergedData.vertices[idx * 3 + 2] - planeZ;
+                if (std::fabs(normal[0] * dx + normal[1] * dy + normal[2] * dz) > 1e-5f) {
+                    coplanar = false;
+                    break;
+                }
+            }
+            if (!coplanar) continue;
             int dropAxis = determineDropAxis(normal);
             bool allInside = true;
             for (int idx : faceIndices2) {
@@ -1947,6 +1973,3 @@ FaceType GetFaceTypeByIndex(size_t faceIndex) {
         default: return FaceType::UNKNOWN;
     }
 }
-
-
-

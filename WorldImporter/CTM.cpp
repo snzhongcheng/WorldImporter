@@ -1,4 +1,4 @@
-// ==================== OptiFine CTM 连接材质实现 ====================
+﻿// ==================== OptiFine CTM 连接材质实现 ====================
 #include "CTM.h"
 #include "block.h"          // GetBlockId / GetBlockById / Block
 #include "model.h"          // ModelData / Face / Material / FaceType
@@ -200,8 +200,16 @@ void InitializeCtmRules() {
 
         if (kv.count("matchBlocks")) rule.matchBlocks = SplitComma(kv["matchBlocks"]);
         if (kv.count("matchTiles")) {
-            for (auto& t : SplitComma(kv["matchTiles"]))
+            for (auto& t : SplitComma(kv["matchTiles"])) {
+                std::string tileNs = ns;
+                size_t tileColon = t.find(':');
+                if (tileColon != std::string::npos) {
+                    tileNs = t.substr(0, tileColon);
+                    t = t.substr(tileColon + 1);
+                }
                 rule.matchTiles.push_back(NormalizeTextureName(t));
+                rule.matchTileNamespaces.push_back(tileNs);
+            }
         }
         if (kv.count("method")) rule.method = ParseMethod(kv["method"]);
         else rule.method = CtmMethod::Unknown;
@@ -225,8 +233,10 @@ void InitializeCtmRules() {
                 g_rulesByBlock[ns + ":" + b].push_back(idx);
             }
         }
-        for (const auto& t : g_ctmRules[idx].matchTiles) {
-            g_rulesByTile[ns + ":" + t].push_back(idx);
+        for (size_t i = 0; i < g_ctmRules[idx].matchTiles.size(); ++i) {
+            const std::string& tileNs = g_ctmRules[idx].matchTileNamespaces[i];
+            const std::string& t = g_ctmRules[idx].matchTiles[i];
+            g_rulesByTile[tileNs + ":" + t].push_back(idx);
         }
     }
 
@@ -364,6 +374,7 @@ static FaceType InferDirectionFromFace(const ModelData& model, const Face& face)
 struct FaceLayout {
     std::array<int,3> up, down, left, right;
     std::array<int,3> upLeft, upRight, downLeft, downRight;
+    std::array<int,4> quadrantMap{ 0,1,2,3 };
 };
 
 static FaceLayout GetFaceLayout(FaceType ft) {
@@ -395,6 +406,67 @@ static FaceLayout GetFaceLayout(FaceType ft) {
     L.upRight   = { L.up[0]+L.right[0],  L.up[1]+L.right[1],  L.up[2]+L.right[2] };
     L.downLeft  = { L.down[0]+L.left[0], L.down[1]+L.left[1], L.down[2]+L.left[2] };
     L.downRight = { L.down[0]+L.right[0],L.down[1]+L.right[1],L.down[2]+L.right[2] };
+    return L;
+}
+
+static int GetTextureOrientation(const ModelData& model, const Face& face, FaceType ft) {
+    std::array<std::array<float, 3>, 4> pos{};
+    std::array<std::array<float, 2>, 4> uv{};
+    for (int i = 0; i < 4; ++i) {
+        if (face.vertexIndices[i] < 0 || face.uvIndices[i] < 0) return 0;
+        size_t vi = static_cast<size_t>(face.vertexIndices[i]) * 3;
+        size_t ui = static_cast<size_t>(face.uvIndices[i]) * 2;
+        if (vi + 2 >= model.vertices.size() || ui + 1 >= model.uvCoordinates.size()) return 0;
+        pos[i] = { model.vertices[vi], model.vertices[vi + 1], model.vertices[vi + 2] };
+        uv[i] = { model.uvCoordinates[ui], 1.0f - model.uvCoordinates[ui + 1] };
+    }
+    float tm00 = uv[3][0] - uv[1][0], tm01 = uv[3][1] - uv[1][1];
+    float tm10 = uv[2][0] - uv[0][0], tm11 = uv[2][1] - uv[0][1];
+    float determinant = tm00 * tm11 - tm10 * tm01;
+    if (std::abs(determinant) < 1e-6f) return 0;
+    float itm10 = -tm10 / determinant, itm11 = tm00 / determinant;
+
+    int xAxis = 0, xSign = 1, yAxis = 1, ySign = 1;
+    switch (ft) {
+    case FaceType::DOWN:  xAxis = 0; yAxis = 2; break;
+    case FaceType::UP:    xAxis = 0; yAxis = 2; ySign = -1; break;
+    case FaceType::NORTH: xAxis = 0; xSign = -1; yAxis = 1; break;
+    case FaceType::SOUTH: xAxis = 0; yAxis = 1; break;
+    case FaceType::WEST:  xAxis = 2; yAxis = 1; break;
+    case FaceType::EAST:  xAxis = 2; xSign = -1; yAxis = 1; break;
+    default: return 0;
+    }
+    float pm00 = pos[3][xAxis] - pos[1][xAxis], pm01 = pos[3][yAxis] - pos[1][yAxis];
+    float pm10 = pos[2][xAxis] - pos[0][xAxis], pm11 = pos[2][yAxis] - pos[0][yAxis];
+    float x = -(pm00 * itm10 + pm10 * itm11) * xSign;
+    float y = -(pm01 * itm10 + pm11 * itm11) * ySign;
+    int rotation = std::abs(y) >= std::abs(x) ? (y > 0.0f ? 0 : 2) : (x > 0.0f ? 3 : 1);
+    return rotation + (determinant < 0.0f ? 4 : 0);
+}
+
+static FaceLayout GetFaceLayout(const ModelData& model, const Face& face, FaceType ft) {
+    static constexpr int directionMaps[8][4] = {
+        {0,1,2,3}, {1,2,3,0}, {2,3,0,1}, {3,0,1,2},
+        {2,1,0,3}, {3,2,1,0}, {0,3,2,1}, {1,0,3,2}
+    };
+    static constexpr int quadrantMaps[8][4] = {
+        {0,1,2,3}, {3,0,1,2}, {2,3,0,1}, {1,2,3,0},
+        {3,2,1,0}, {0,3,2,1}, {1,0,3,2}, {2,1,0,3}
+    };
+    FaceLayout base = GetFaceLayout(ft);
+    const std::array<int,3>* dirs[4] = { &base.left, &base.down, &base.right, &base.up };
+    int orientation = GetTextureOrientation(model, face, ft);
+    FaceLayout L{};
+    L.left = *dirs[directionMaps[orientation][0]];
+    L.down = *dirs[directionMaps[orientation][1]];
+    L.right = *dirs[directionMaps[orientation][2]];
+    L.up = *dirs[directionMaps[orientation][3]];
+    L.quadrantMap = { quadrantMaps[orientation][0], quadrantMaps[orientation][1],
+                      quadrantMaps[orientation][2], quadrantMaps[orientation][3] };
+    L.upLeft = { L.up[0] + L.left[0], L.up[1] + L.left[1], L.up[2] + L.left[2] };
+    L.upRight = { L.up[0] + L.right[0], L.up[1] + L.right[1], L.up[2] + L.right[2] };
+    L.downLeft = { L.down[0] + L.left[0], L.down[1] + L.left[1], L.down[2] + L.left[2] };
+    L.downRight = { L.down[0] + L.right[0], L.down[1] + L.right[1], L.down[2] + L.right[2] };
     return L;
 }
 
@@ -643,7 +715,7 @@ static CtmTexInfo GetOrCreateCompactTexInfo(const std::string& ns, const std::st
     // 4 个象限选择 tile (象限索引: 0=TL 1=BL 2=BR 3=TR)
     int tileSel[4];
     for (int q = 0; q < 4; ++q) {
-        int t = CompactGetSpriteIndex(q, connections);
+        int t = CompactGetSpriteIndex(L.quadrantMap[q], connections);
         if (t >= (int)rule.tiles.size()) {
             t = 1;  // 退化到全连
         }

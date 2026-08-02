@@ -46,6 +46,7 @@ struct CtmRule {
     std::string baseDir;                // tile 所在目录(相对 namespace),例如 optifine/ctm/glass/glass
     std::vector<std::string> matchBlocks;  // matchBlocks 值,可能含 _stained_glass 通配
     std::vector<std::string> matchTiles;   // matchTiles 值
+    std::vector<std::string> matchTileNamespaces; // 每个 matchTiles 对应的纹理命名空间
     CtmMethod method = CtmMethod::None;
     std::vector<int> tiles;             // tile 编号列表
     std::vector<std::string> faces;     // faces 过滤(sides/all/north,...)

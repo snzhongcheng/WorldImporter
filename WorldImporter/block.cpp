@@ -545,12 +545,30 @@ void ProcessEntityBlocks(int chunkX, int chunkZ, const NbtTagPtr& blockEntitiesT
             basicEntity->z = z;
             entityBlocks.push_back(basicEntity);
         }
+
+        entityBlocks.back()->rawNbt = entityTag;
     }
 
     // 存入缓存，使用互斥锁保护
     auto chunkKey = std::make_pair(chunkX, chunkZ);
     std::unique_lock<std::shared_mutex> lock(entityBlockCacheMutex);
     EntityBlockCache[chunkKey] = entityBlocks;
+}
+
+NbtTagPtr GetBlockEntityNbt(int blockX, int blockY, int blockZ) {
+    int chunkX, chunkZ;
+    blockToChunk(blockX, blockZ, chunkX, chunkZ);
+
+    std::shared_lock<std::shared_mutex> lock(entityBlockCacheMutex);
+    auto it = EntityBlockCache.find(std::make_pair(chunkX, chunkZ));
+    if (it == EntityBlockCache.end()) return nullptr;
+
+    for (const auto& entity : it->second) {
+        if (entity && entity->x == blockX && entity->y == blockY && entity->z == blockZ) {
+            return entity->rawNbt;
+        }
+    }
+    return nullptr;
 }
 
 
@@ -659,8 +677,7 @@ int GetBlockIdWithNeighbors(int blockX, int blockY, int blockZ, bool* neighborIs
     Block currentBlock = GetBlockById(currentId);
     std::string currentBaseName = currentBlock.GetNameAndNameSpaceWithoutState();
 
-    bool isFluid = fluidDefinitions.find(currentBaseName) != fluidDefinitions.end();
-    bool hasFluidData = (currentBlock.level != -1);
+    bool hasFluidData = currentBlock.HasFluid();
 
     // 统一处理 neighborIsAir 数组(6个方向)
     if (neighborIsAir != nullptr) {
@@ -683,6 +700,7 @@ int GetBlockIdWithNeighbors(int blockX, int blockY, int blockZ, bool* neighborIs
             // 如果启用了保留边界面,则直接判断
             if (config.keepBoundary &&
                 ((nx == config.maxX + 1) || (nx == config.minX - 1) ||
+                    (ny == config.maxY + 1) || (ny == config.minY - 1) ||
                     (nz == config.maxZ + 1) || (nz == config.minZ - 1))) {
                 neighborIsAir[i] = true;
                 continue;
@@ -692,11 +710,17 @@ int GetBlockIdWithNeighbors(int blockX, int blockY, int blockZ, bool* neighborIs
             Block neighborBlock = GetBlockById(neighborId);
 
             if (hasFluidData) {
+                bool isSameFluid = neighborBlock.HasFluid() &&
+                    currentBlock.fluidName == neighborBlock.fluidName;
+                // Only render water side faces next to true air blocks.
+                // Solid/transparent/mod blocks (even if absent from the solids
+                // table) hide the water side, avoiding a visible water sheet
+                // hugging full blocks.
                 std::string neighborBase = neighborBlock.GetNameAndNameSpaceWithoutState();
-                bool isSameFluid = (currentBaseName == neighborBase);
-                bool neighborIsFluid = (fluidDefinitions.find(neighborBase) != fluidDefinitions.end());
-                neighborIsAir[i] = (isSameFluid && (neighborBlock.level != 0 && neighborBlock.level != -1)) ||
-                    (neighborBlock.level != 0 && !neighborIsFluid && neighborBlock.air);
+                bool isTrueAir = (neighborBase == "minecraft:air" ||
+                                  neighborBase == "minecraft:cave_air" ||
+                                  neighborBase == "minecraft:void_air");
+                neighborIsAir[i] = !isSameFluid && (isTrueAir || neighborBlock.HasFluid());
             }
             else {
                 neighborIsAir[i] = neighborBlock.air;
@@ -707,7 +731,7 @@ int GetBlockIdWithNeighbors(int blockX, int blockY, int blockZ, bool* neighborIs
     // 处理 fluidLevels 数组,仅在存在流体数据且数组不为空时进行
     if (hasFluidData && fluidLevels != nullptr) {
         // 中心块的流体等级
-        fluidLevels[0] = GetLevel(blockX, blockY, blockZ);
+        fluidLevels[0] = GetLevel(blockX, blockY, blockZ, currentBlock.fluidName);
         static const std::array<std::tuple<int, int, int>, 9> levelDirections = { {
             {0, 0, -1},   // 北
             {0, 0, 1},    // 南
@@ -722,7 +746,7 @@ int GetBlockIdWithNeighbors(int blockX, int blockY, int blockZ, bool* neighborIs
         for (size_t i = 0; i < levelDirections.size(); ++i) {
             int dx, dy, dz;
             std::tie(dx, dy, dz) = levelDirections[i];
-            fluidLevels[i + 1] = GetLevel(blockX + dx, blockY + dy, blockZ + dz);
+            fluidLevels[i + 1] = GetLevel(blockX + dx, blockY + dy, blockZ + dz, currentBlock.fluidName);
         }
     }
 
@@ -763,31 +787,28 @@ int GetHeightMapY(int blockX, int blockZ, const std::string& heightMapType) {
     return result;
 }
 
-int GetLevel(int blockX, int blockY, int blockZ) {
+int GetLevel(int blockX, int blockY, int blockZ, const std::string& expectedFluidName) {
     int currentId = GetBlockId(blockX, blockY, blockZ);
     Block currentBlock = GetBlockById(currentId);
-    std::string baseName = currentBlock.GetNameAndNameSpaceWithoutState(); // 获取带命名空间的完整名称
-
-    // 判断当前方块是否是注册流体或已有level标记
-    bool isFluid = fluidDefinitions.find(baseName) != fluidDefinitions.end();
-
-    if (isFluid || currentBlock.level == 0) {
+    if (currentBlock.HasFluid() &&
+        (expectedFluidName.empty() || currentBlock.fluidName == expectedFluidName)) {
         // 检查上方方块
         int upperId = GetBlockId(blockX, blockY + 1, blockZ);
         Block upperBlock = GetBlockById(upperId);
-        std::string upperBaseName = upperBlock.GetNameAndNameSpaceWithoutState();
-
-        bool upperIsFluid = fluidDefinitions.find(upperBaseName) != fluidDefinitions.end();
-
-        if (upperIsFluid || upperBlock.level == 0) {
-            return 8; // 上方是流体
+        if (upperBlock.HasFluid() && upperBlock.fluidName == currentBlock.fluidName) {
+            return FULL_FLUID_LEVEL;
         }
         else {
             return currentBlock.level; // 当前流体level
         }
     }
 
-    return currentBlock.air ? -1 : -2; // 空气返回-1,固体返回-2
+    // Any non-air block (opaque or transparent, even if not in solids table)
+    // presses the water surface to full height. Otherwise a ~0.11 block air gap
+    // appears between the water top and the block bottom.
+    std::string baseName = currentBlock.GetNameAndNameSpaceWithoutState();
+    bool isAirBlock = (baseName == "minecraft:air" || baseName == "minecraft:cave_air" || baseName == "minecraft:void_air");
+    return isAirBlock ? -1 : -2;
 }
 
 int GetSkyLight(int blockX, int blockY, int blockZ) {

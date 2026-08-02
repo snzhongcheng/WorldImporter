@@ -28,6 +28,7 @@ namespace GlobalCache {
 
 	// 模型缓存 [modId:namespace:model_path -> JSON]
 	extern std::unordered_map<std::string, nlohmann::json> models;
+	extern std::unordered_map<std::string, std::string> modelAssets;
 
 	// 生物群系缓存 [modId:namespace:biome_id -> JSON]
 	extern std::unordered_map<std::string, nlohmann::json> biomes;
@@ -45,6 +46,7 @@ namespace GlobalCache {
 	// 直接查找键: "blockstates:<namespace>:<resourcePath>" -> 对应完整缓存键
 	extern std::unordered_map<std::string, std::string> blockstateIndex;
 	extern std::unordered_map<std::string, std::string> modelIndex;
+	extern std::unordered_map<std::string, std::string> modelAssetIndex;
 	extern std::unordered_map<std::string, std::string> textureIndex;
 	extern std::unordered_map<std::string, std::string> mcmetaIndex;
 	extern std::unordered_map<std::string, std::string> biomeIndex;
