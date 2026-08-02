@@ -25,6 +25,7 @@
 #include "hashutils.h"
 #include "ChunkLoader.h"
 #include "SpecialBlock.h"
+#include "BbsModelSupport.h"
 using namespace std;
 using namespace std::chrono;
 
@@ -136,9 +137,13 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
 
     ModelData blockModel;
     ModelData liquidModel;
-    bool specialHandled = SpecialBlock::TryGenerateCreateBlockModel(
+    NbtTagPtr blockEntityNbt = GetBlockEntityNbt(x, y, z);
+    bool specialHandled = TryGenerateBbsModel(blockEntityNbt, x, y, z, blockModel);
+    if (!specialHandled) {
+        specialHandled = SpecialBlock::TryGenerateCreateBlockModel(
         currentBlock.GetModifiedNameWithNamespace(), x, y, z,
-        GetBlockEntityNbt(x, y, z), blockModel);
+            blockEntityNbt, blockModel);
+    }
     if (specialHandled) {
         for (auto& face : blockModel.faces) face.faceDirection = FaceType::DO_NOT_CULL;
     }
