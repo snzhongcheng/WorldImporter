@@ -418,58 +418,24 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
     
     auto t2_adj_start = Clock::now();
     
-    // 分段处理以并行化
-    const size_t segmentSize = (allEdges.size() + numThreads2 - 1) / numThreads2;
-    std::vector<std::thread> adjThreads;
-    adjThreads.reserve(numThreads2);
-    std::mutex adjMutex; // 用于同步边界处理
-    
-    for (unsigned int t = 0; t < numThreads2; ++t) {
-        size_t startIdx = t * segmentSize;
-        size_t endIdx = std::min(startIdx + segmentSize, allEdges.size());
-        
-        // 确保相同key的边不会被拆分到不同线程
-        if (t > 0 && startIdx < allEdges.size()) {
-            EdgeKey prevKey = allEdges[startIdx-1].first;
-            while (startIdx < allEdges.size() && allEdges[startIdx].first == prevKey) {
-                startIdx++;
+    // 按边顺序构建邻接表。旧实现按边分段并行，但同一个面拥有多条边，
+    // 不同线程会同时向同一个 faceAdj[f] vector push_back，造成堆损坏。
+    // 此步骤通常仅占几毫秒，串行处理比为每个面加锁更快且稳定。
+    size_t edgeIndex = 0;
+    while (edgeIndex < allEdges.size()) {
+        const EdgeKey edgeKey = allEdges[edgeIndex].first;
+        std::vector<int> edgeFaces;
+        while (edgeIndex < allEdges.size() && allEdges[edgeIndex].first == edgeKey) {
+            edgeFaces.push_back(allEdges[edgeIndex].second);
+            ++edgeIndex;
+        }
+        for (size_t i = 0; i < edgeFaces.size(); ++i) {
+            const int f1 = edgeFaces[i];
+            for (size_t j = 0; j < edgeFaces.size(); ++j) {
+                if (i != j) faceAdj[f1].push_back(edgeFaces[j]);
             }
         }
-        
-        // 确保endIdx也在边界上
-        if (t < numThreads2-1 && endIdx < allEdges.size()) {
-            EdgeKey currKey = allEdges[endIdx-1].first;
-            while (endIdx < allEdges.size() && allEdges[endIdx].first == currKey) {
-                endIdx++;
-            }
-        }
-        
-        adjThreads.emplace_back([&, startIdx, endIdx]() {
-            size_t idx = startIdx;
-            while (idx < endIdx) {
-                EdgeKey ek = allEdges[idx].first;
-                // 找到所有具有相同边的面
-                std::vector<int> edgeFaces;
-                while (idx < endIdx && allEdges[idx].first == ek) {
-                    edgeFaces.push_back(allEdges[idx].second);
-                    idx++;
-                }
-                
-                // 为每个面添加相邻面
-                for (size_t i = 0; i < edgeFaces.size(); ++i) {
-                    int f1 = edgeFaces[i];
-                    for (size_t j = 0; j < edgeFaces.size(); ++j) {
-                        if (i != j) {
-                            int f2 = edgeFaces[j];
-                            faceAdj[f1].push_back(f2);
-                        }
-                    }
-                }
-            }
-        });
     }
-    
-    for (auto& th : adjThreads) th.join();
     
     // 释放内存
     std::vector<std::pair<EdgeKey,int>>().swap(allEdges);

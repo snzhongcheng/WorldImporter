@@ -15,6 +15,7 @@
 #include "GlobalCache.h"
 #include <future>
 #include <mutex>
+#include <atomic>
 
 struct WeightedModelData {
     ModelData model;
@@ -31,6 +32,7 @@ extern std::unordered_map<std::string,
 extern std::unordered_map<std::string,
     std::unordered_map<std::string,
     std::vector<std::vector<WeightedModelData>>>> MultipartModelCache; // multipart部件缓存
+extern std::atomic<bool> blockstateCachesFrozen;
 
 bool matchConditions(const std::unordered_map<std::string, std::string>& blockConditions, const nlohmann::json& when);
 

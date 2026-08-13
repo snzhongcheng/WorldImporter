@@ -496,6 +496,15 @@ void CreateSharedMtlFile(std::unordered_map<std::string, std::string> uniqueMate
                 mtlFile << "Ni 1.500000\n";
                 mtlFile << "illum 2\n";
             }
+            // 缺失纹理不写虚假的 .png 引用，避免 Blender 显示紫色材质。
+            else if (texturePath.empty()) {
+                mtlFile << "Ns 90.000000\n";
+                mtlFile << "Kd 1.000000 1.000000 1.000000\n";
+                mtlFile << "Ks 0.000000 0.000000 0.000000\n";
+                mtlFile << "Ke 0.000000 0.000000 0.000000\n";
+                mtlFile << "Ni 1.500000\n";
+                mtlFile << "illum 1\n";
+            }
             // 处理纯颜色材质(支持流体格式:color#r g b-流体名 和普通格式:color#r g b=)
             else if (texturePath.find("color#") != std::string::npos) {
                 std::string colorStr;
@@ -581,6 +590,15 @@ void createMtlFile(const ModelData& data, const std::string& mtlFileName) {
                 mtlFile << "Ke 0.900000 0.900000 0.900000\n";
                 mtlFile << "Ni 1.500000\n";
                 mtlFile << "illum 2\n";
+            }
+            // 缺失纹理不写虚假的 .png 引用，避免 Blender 显示紫色材质。
+            else if (texturePath.empty()) {
+                mtlFile << "Ns 90.000000\n";
+                mtlFile << "Kd 1.000000 1.000000 1.000000\n";
+                mtlFile << "Ks 0.000000 0.000000 0.000000\n";
+                mtlFile << "Ke 0.000000 0.000000 0.000000\n";
+                mtlFile << "Ni 1.500000\n";
+                mtlFile << "illum 1\n";
             }
             // 处理纯颜色材质(支持流体格式:color#r g b-流体名 和普通格式:color#r g b=)
             else if (texturePath.find("color#") != std::string::npos) {

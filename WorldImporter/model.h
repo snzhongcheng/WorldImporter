@@ -194,7 +194,9 @@ nlohmann::json GetModelJson(const std::string& namespaceName,
     const std::string& modelPath);
 nlohmann::json LoadParentModel(const std::string& namespaceName,
     const std::string& blockId,
-    nlohmann::json& currentModelJson);
+    nlohmann::json& currentModelJson,
+    std::unordered_set<std::string>* visiting = nullptr,
+    int depth = 0);
 nlohmann::json MergeModelJson(const nlohmann::json& parentModelJson,
     const nlohmann::json& currentModelJson);
 

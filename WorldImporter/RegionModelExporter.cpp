@@ -180,6 +180,19 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         return std::make_tuple(b.chunkXStart - 1, b.chunkXEnd + 1, b.chunkZStart - 1, b.chunkZEnd + 1);
     };
 
+    // 预计算每个边界区块最后一次被哪个批次使用。旧实现每完成一个批次都
+    // 扫描全部未来批次，复杂度接近 O(B²)，自动小批次时会明显拖慢。
+    std::unordered_map<std::pair<int, int>, size_t, pair_hash> chunkLastUseBatch;
+    for (size_t idx = 0; idx < ChunkGroupAllocator::g_chunkBatches.size(); ++idx) {
+        int ex0, ex1, ez0, ez1;
+        std::tie(ex0, ex1, ez0, ez1) = get_batch_expanded_coords(ChunkGroupAllocator::g_chunkBatches[idx]);
+        for (int cx = ex0; cx <= ex1; ++cx) {
+            for (int cz = ez0; cz <= ez1; ++cz) {
+                chunkLastUseBatch[{cx, cz}] = idx;
+            }
+        }
+    }
+
     for (size_t current_batch_idx = 0; current_batch_idx < ChunkGroupAllocator::g_chunkBatches.size(); ++current_batch_idx) {
         const auto& batch = ChunkGroupAllocator::g_chunkBatches[current_batch_idx];
         batchId = current_batch_idx + 1;
@@ -196,8 +209,12 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         std::tie(bExpXStart, bExpXEnd, bExpZStart, bExpZEnd) = get_batch_expanded_coords(batch);
 
         size_t beforeLoad = CountLoadedChunks();
+        globalPaletteFrozen.store(false, std::memory_order_release);
+        blockstateCachesFrozen.store(false, std::memory_order_release);
         ChunkLoader::LoadChunks(bExpXStart, bExpXEnd, bExpZStart, bExpZEnd,
                                 sectionYStart, sectionYEnd);
+        globalPaletteFrozen.store(true, std::memory_order_release);
+        blockstateCachesFrozen.store(true, std::memory_order_release);
         size_t afterLoad = CountLoadedChunks();
         size_t newlyLoaded = (afterLoad > beforeLoad) ? (afterLoad - beforeLoad) : 0;
 
@@ -217,7 +234,11 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         // 重置当前批次的完成任务计数
         std::atomic<size_t> batchCompletedTasks{0};
 
-        unsigned numThreads = std::max<unsigned>(1, std::thread::hardware_concurrency());
+        // Python 自动模式根据可用内存和 CPU 选择 1~4 个线程；手写/旧配置
+        // 默认仍为 1。相关模型、CTM、纹理和调色板缓存均已改为并发只读或加锁。
+        const unsigned numThreads = std::max<unsigned>(1,
+            std::min<unsigned>(static_cast<unsigned>(config.modelThreads),
+                               static_cast<unsigned>(std::max<size_t>(1, groupsInBatch.size()))));
         std::atomic<size_t> groupIndex{0};
         std::vector<std::thread> threads;
         threads.reserve(numThreads);
@@ -229,9 +250,12 @@ void RegionModelExporter::ExportModels(const string& outputName) {
                     if (idx >= groupsInBatch.size()) break;
                     const auto& group = groupsInBatch[idx];
                     ModelData groupModel;
-                    groupModel.vertices.reserve(4096 * group.tasks.size());
-                    groupModel.faces.reserve(8192 * group.tasks.size());
-                    groupModel.uvCoordinates.reserve(4096 * group.tasks.size());
+                    // 不再按整个大组的最坏情况一次预留（Face 约 40 字节，旧逻辑
+                    // 可能瞬间预留数百 MiB）。先预留最多 32 个任务，后续按需增长。
+                    const size_t reserveTasks = std::min<size_t>(group.tasks.size(), 32);
+                    groupModel.vertices.reserve(4096 * reserveTasks);
+                    groupModel.faces.reserve(8192 * reserveTasks);
+                    groupModel.uvCoordinates.reserve(4096 * reserveTasks);
                     std::unordered_map<string, string> localMaterials;
                     std::unordered_map<string, int8_t> localTints;
 
@@ -251,17 +275,25 @@ void RegionModelExporter::ExportModels(const string& outputName) {
                                 int blockXEnd = blockXStart + 15;
                                 int blockZStart = task.chunkZ * 16;
                                 int blockZEnd = blockZStart + 15;
+                                // 确保区块数据已加载(填充高度图),再生成生物群系地图
+                                {
+                                    std::shared_lock<std::shared_mutex> sc_lk(sectionCacheMutex);
+                                    auto k0 = std::make_tuple(task.chunkX, task.chunkZ, 0);
+                                    bool needLoad = sectionCache.find(k0) == sectionCache.end();
+                                    sc_lk.unlock();
+                                    if (needLoad) {
+                                        LoadAndCacheBlockData(task.chunkX, task.chunkZ);
+                                    }
+                                }
                                 // 生成该区块的生物群系地图数据
                                 Biome::GenerateBiomeMap(blockXStart, blockZStart, blockXEnd, blockZEnd);
                                 processedBiomeChunks.insert(chunkKey);
                             }
                         }
 
-                        ModelData chunkModel;
-                            chunkModel.vertices.reserve(4096);
-                            chunkModel.faces.reserve(8192);
-                            chunkModel.uvCoordinates.reserve(4096);
-                            chunkModel = processModel(task);
+                        // processModel 返回可移动对象；提前 reserve 随即会被移动赋值
+                        // 丢弃，旧代码每个 section 都做了三次无效分配。
+                        ModelData chunkModel = processModel(task);
                         if (groupModel.vertices.empty()) {
                             groupModel = std::move(chunkModel);
                         } else {
@@ -333,14 +365,13 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         // ---------- 卸载当前批次 ----------
         size_t beforeUnload = CountLoadedChunks();
 
-        // 构建需要为未来批次保留的扩展区块集合
+        // 仅检查当前批次范围内的区块是否还有未来用途，查询预计算的最后
+        // 使用批次即可，避免重复扫描全部未来批次。
         std::unordered_set<std::pair<int, int>, pair_hash> retain_for_future_batches;
-        for (size_t future_batch_idx = current_batch_idx + 1; future_batch_idx < ChunkGroupAllocator::g_chunkBatches.size(); ++future_batch_idx) {
-            const auto& future_batch = ChunkGroupAllocator::g_chunkBatches[future_batch_idx];
-            int fbExpXStart, fbExpXEnd, fbExpZStart, fbExpZEnd;
-            std::tie(fbExpXStart, fbExpXEnd, fbExpZStart, fbExpZEnd) = get_batch_expanded_coords(future_batch);
-            for (int cx = fbExpXStart; cx <= fbExpXEnd; ++cx) {
-                for (int cz = fbExpZStart; cz <= fbExpZEnd; ++cz) {
+        for (int cx = bExpXStart; cx <= bExpXEnd; ++cx) {
+            for (int cz = bExpZStart; cz <= bExpZEnd; ++cz) {
+                auto lastUse = chunkLastUseBatch.find({cx, cz});
+                if (lastUse != chunkLastUseBatch.end() && lastUse->second > current_batch_idx) {
                     retain_for_future_batches.insert({cx, cz});
                 }
             }

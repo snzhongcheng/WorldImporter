@@ -16,8 +16,8 @@ enum MaterialType {
 };
 
 // 纹理缓存和互斥锁
-extern std::unordered_map<std::string, std::string> texturePathCache; 
-static std::mutex texturePathCacheMutex;
+extern std::unordered_map<std::string, std::string> texturePathCache;
+extern std::mutex texturePathCacheMutex;
 
 // 新增：纹理尺寸缓存（保存图片的宽高比）
 struct TextureDimension {
@@ -29,7 +29,7 @@ struct TextureDimension {
     TextureDimension(int w, int h) : width(w), height(h), aspectRatio(h > 0 && w > 0 ? static_cast<float>(h) / w : 1.0f) {}
 };
 extern std::unordered_map<std::string, TextureDimension> textureDimensionCache;
-static std::mutex textureDimensionMutex;
+extern std::mutex textureDimensionMutex;
 
 // 材质注册方法
 void RegisterTexture(const std::string& namespaceName, const std::string& pathPart, const std::string& savePath);

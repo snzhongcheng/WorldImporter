@@ -497,8 +497,11 @@ std::vector<int> readIntArray(const std::vector<char>& payload) {
         // 例如:throw std::runtime_error("Invalid payload size for int array conversion.");
     }
     for (size_t i = 0; i < payload.size(); i += 4) {
-        int value = (payload[i] << 24) | (payload[i + 1] << 16) | (payload[i + 2] << 8) | (payload[i + 3]);
-        result.push_back(value);
+        uint32_t value = (static_cast<uint32_t>(static_cast<unsigned char>(payload[i])) << 24) |
+            (static_cast<uint32_t>(static_cast<unsigned char>(payload[i + 1])) << 16) |
+            (static_cast<uint32_t>(static_cast<unsigned char>(payload[i + 2])) << 8) |
+             static_cast<uint32_t>(static_cast<unsigned char>(payload[i + 3]));
+        result.push_back(static_cast<int32_t>(value));
     }
     return result;
 }

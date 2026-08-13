@@ -9,6 +9,7 @@
 #include "Fluid.h"
 #include "LODManager.h"
 #include "CTM.h"
+#include "CreateCT.h"
 #include "texture.h"
 #include <iomanip>
 #include <sstream>
@@ -200,9 +201,16 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
 
     // Preserve Yuushya's block-state geometry for partial blocks, while full
     // cubes still use their CTM rules like other blocks.
-    bool useCtm = !specialHandled && HasCtmRules() && ns != "create" && (ns != "yuushya" || IsFullCubeModel(blockModel));
-    if (useCtm) {
+    // Create 的连接纹理是运行时 UV 重映射(自带 *_connected.png), 与 OptiFine CTM
+    // 是两套系统, 单独走 CreateCT 路径。
+    bool useCtm = false;
+    if (!specialHandled && ns == "create") {
+        useCtm = ApplyCreateCTToBlockModel(blockModel, ns, blockName, x, y, z);
+    }
+    if (!useCtm && !specialHandled && HasCtmRules() && ns != "create" &&
+        (ns != "yuushya" || IsFullCubeModel(blockModel))) {
         ApplyCtmToBlockModel(blockModel, ns, blockName, x, y, z);
+        useCtm = true;
     }
 
     // 剔除被遮挡的面

@@ -39,6 +39,8 @@ using namespace std;
 // 带读写锁的区块缓存
 std::shared_mutex sectionCacheMutex;
 std::shared_mutex chunkAuxCacheMutex;
+std::mutex globalPaletteMutex;
+std::atomic<bool> globalPaletteFrozen{false};
 std::unordered_map<std::tuple<int, int, int>, SectionCacheEntry, triple_hash> sectionCache(4096);
 
 // 为 EntityBlockCache 和 heightMapCache 定义新的互斥锁
@@ -50,6 +52,8 @@ std::unordered_map<std::pair<int, int>, std::vector<std::shared_ptr<EntityBlock>
 std::unordered_map<std::pair<int, int>, std::unordered_map<std::string, std::vector<int>>, pair_hash> heightMapCache(1024);
 
 std::vector<Block> globalBlockPalette;
+// 全局方块名->调色板索引映射(全局唯一一份,与 globalBlockPalette 由同一把锁保护)。
+std::unordered_map<std::string, int> globalBlockMap;
 
 
 // 添加静态邻居偏移数组,避免重复构造
@@ -120,45 +124,41 @@ void ProcessSection(int chunkX, int chunkZ, int sectionY, const NbtTagPtr& secti
     std::vector<int> globalBlockData;
     globalBlockData.reserve(blockData.size()); // 预分配空间
 
-    static std::unordered_map<std::string, int> globalBlockMap; // 预处理全局调色板映射
+    // 全局调色板注册:并发写 globalBlockPalette/globalBlockMap 需加锁 (短临界区)
+    // 注意:不在此锁内调用 ProcessBlockstateForBlocks,避免锁序死锁
+    {
+        std::lock_guard<std::mutex> paletteLock(globalPaletteMutex);
 
-    // 预处理全局调色板,建立快速查找的映射
-    if (globalBlockMap.empty()) {
-        for (size_t i = 0; i < globalBlockPalette.size(); ++i) {
-            const Block& block = globalBlockPalette[i];
-            if (globalBlockMap.find(block.name) == globalBlockMap.end()) {
-                globalBlockMap[block.name] = static_cast<int>(i);
+        // 预处理全局调色板,建立快速查找的映射
+        if (globalBlockMap.empty()) {
+            for (size_t i = 0; i < globalBlockPalette.size(); ++i) {
+                const Block& block = globalBlockPalette[i];
+                if (globalBlockMap.find(block.name) == globalBlockMap.end()) {
+                    globalBlockMap[block.name] = static_cast<int>(i);
+                }
             }
         }
-    }
 
-    for (int relativeId : blockData) {
-        if (relativeId < 0 || relativeId >= static_cast<int>(blockPalette.size())) {
-            globalBlockData.push_back(0);
-            continue;
-        }
+        for (int relativeId : blockData) {
+            if (relativeId < 0 || relativeId >= static_cast<int>(blockPalette.size())) {
+                globalBlockData.push_back(0);
+                continue;
+            }
 
-        const std::string& blockName = blockPalette[relativeId];
-        auto it = globalBlockMap.find(blockName);
-        if (it != globalBlockMap.end()) {
-            globalBlockData.push_back(it->second);
-        }
-        else {
-            int idx = static_cast<int>(globalBlockPalette.size());
-            globalBlockPalette.emplace_back(blockName); // 新方块添加到全局调色板
-            globalBlockMap[blockName] = idx;
-            globalBlockData.push_back(idx);
+            const std::string& blockName = blockPalette[relativeId];
+            auto it = globalBlockMap.find(blockName);
+            if (it != globalBlockMap.end()) {
+                globalBlockData.push_back(it->second);
+            }
+            else {
+                int idx = static_cast<int>(globalBlockPalette.size());
+                globalBlockPalette.emplace_back(blockName); // 新方块添加到全局调色板
+                globalBlockMap[blockName] = idx;
+                globalBlockData.push_back(idx);
 
-            // 为新添加的方块生成模型缓存
-            std::vector<Block> newBlockVector;
-            newBlockVector.push_back(globalBlockPalette.back()); // 获取刚添加的方块
-            try {
-                ProcessBlockstateForBlocks(newBlockVector); // 调用处理函数
-            } catch (const std::exception& e) {
-                std::cerr << "Error in ProcessBlockstateForBlocks: " << e.what() << std::endl;
             }
         }
-    }
+    } // 锁在此释放
 
     // 获取生物群系数据
     auto bio = getBiomes(sectionTag);
@@ -431,8 +431,9 @@ void ProcessEntityBlocks(int chunkX, int chunkZ, const NbtTagPtr& blockEntitiesT
                             }
 
                             // 转换为全局 ID
-                            static std::unordered_map<std::string, int> globalBlockMap;
                             if (!blockName.empty()) {
+                                // 加锁保护 globalBlockPalette/globalBlockMap(ProcessSection 也并发写)
+                                std::lock_guard<std::mutex> paletteLock(globalPaletteMutex);
                                 auto it = globalBlockMap.find(blockName);
                                 if (it != globalBlockMap.end()) {
                                     entry.blockid = it->second;
@@ -579,70 +580,84 @@ void LoadAndCacheBlockData(int chunkX, int chunkZ) {
         std::shared_lock<std::shared_mutex> read_lock(sectionCacheMutex);
         if (sectionCache.find(key) != sectionCache.end()) return;
     }
-    std::unique_lock<std::shared_mutex> write_lock(sectionCacheMutex);
-    if (sectionCache.find(key) != sectionCache.end()) return;
-    // 计算区域坐标
-    int regionX, regionZ;
-    chunkToRegion(chunkX, chunkZ, regionX, regionZ);
+    {
+        std::unique_lock<std::shared_mutex> write_lock(sectionCacheMutex);
+        if (sectionCache.find(key) != sectionCache.end()) return;
+        // 先占位标记 (仅当读取失败时也占位)
+        // 注意:不在此锁内做任何模型解析, 只做数据读取和 sectionCache 写入
+        // 计算区域坐标
+        int regionX, regionZ;
+        chunkToRegion(chunkX, chunkZ, regionX, regionZ);
 
-    // 获取区域数据
-    const auto& regionData = GetRegionFromCache(regionX, regionZ);
+        // 获取区域数据
+        const auto& regionData = GetRegionFromCache(regionX, regionZ);
 
-    // 获取区块数据
-    std::vector<char> chunkData = GetChunkNBTData(regionData, chunkX, chunkZ);
-    // 如果数据为空，表示区块文件不存在或读取失败，直接跳过并缓存空条目
-    if (chunkData.empty()) {
-        std::cerr << "警告: 无法加载区块 (" << chunkX << "," << chunkZ << ")，已跳过。" << std::endl;
-        sectionCache[key] = SectionCacheEntry();
-        return;
-    }
-    size_t index = 0;
-    auto tag = readTag(chunkData, index);
+        // 获取区块数据
+        std::vector<char> chunkData = GetChunkNBTData(regionData, chunkX, chunkZ);
+        // 如果数据为空，表示区块文件不存在或读取失败，直接跳过并缓存空条目
+        if (chunkData.empty()) {
+            std::cerr << "警告: 无法加载区块 (" << chunkX << "," << chunkZ << ")，已跳过。" << std::endl;
+            sectionCache[key] = SectionCacheEntry();
+            return;
+        }
+        size_t index = 0;
+        auto tag = readTag(chunkData, index);
 
-    auto yPosTag = getChildByName(tag, "yPos");
-    if (yPosTag && yPosTag->type == TagType::INT) {
-        minSectionY = bytesToInt(yPosTag->payload);
-    }
-    // 处理高度图
-    auto heightMapsTag = getChildByName(tag, "Heightmaps");
-    if (heightMapsTag && heightMapsTag->type == TagType::COMPOUND) {
-        std::unique_lock<std::shared_mutex> hm_lock(heightMapCacheMutex); // 加锁
-        for (const auto& mapType : mapTypes) {
-            auto mapDataTag = getChildByName(heightMapsTag, mapType);
-            if (mapDataTag && mapDataTag->type == TagType::LONG_ARRAY) {
-                size_t numLongs = mapDataTag->payload.size() / sizeof(int64_t);
-                const int64_t* rawData = reinterpret_cast<const int64_t*>(mapDataTag->payload.data());
-                std::vector<int64_t> longData(rawData, rawData + numLongs);
+        auto yPosTag = getChildByName(tag, "yPos");
+        if (yPosTag && yPosTag->type == TagType::INT) {
+            minSectionY = bytesToInt(yPosTag->payload);
+        }
+        // 处理高度图
+        auto heightMapsTag = getChildByName(tag, "Heightmaps");
+        if (heightMapsTag && heightMapsTag->type == TagType::COMPOUND) {
+            std::unique_lock<std::shared_mutex> hm_lock(heightMapCacheMutex); // 加锁
+            int hmFilled = 0;
+            for (const auto& mapType : mapTypes) {
+                auto mapDataTag = getChildByName(heightMapsTag, mapType);
+                if (mapDataTag && mapDataTag->type == TagType::LONG_ARRAY) {
+                    size_t numLongs = mapDataTag->payload.size() / sizeof(int64_t);
+                    const int64_t* rawData = reinterpret_cast<const int64_t*>(mapDataTag->payload.data());
+                    std::vector<int64_t> longData(rawData, rawData + numLongs);
 
-                std::vector<int> heights = DecodeHeightMap(longData);
-                heightMapCache[std::make_pair(chunkX, chunkZ)][mapType] = heights;
+                    std::vector<int> heights = DecodeHeightMap(longData);
+                    heightMapCache[std::make_pair(chunkX, chunkZ)][mapType] = heights;
+                    hmFilled++;
+                }
+            }
+            if (hmFilled == 0 && (chunkX % 8 == 0) && (chunkZ % 8 == 0)) {
+                std::cerr << "[hmFill] chunk(" << chunkX << "," << chunkZ << ") Heightmaps compound but no LONG_ARRAY filled" << std::endl;
+            }
+            // hm_lock 在此处自动解锁
+        }
+        else {
+            if ((chunkX % 8 == 0) && (chunkZ % 8 == 0)) {
+                std::cerr << "[hmFill] chunk(" << chunkX << "," << chunkZ << ") NO Heightmaps tag" << std::endl;
             }
         }
-        // hm_lock 在此处自动解锁
-    }
-    //提取实体方块
-    auto blockEntitiesTag = getChildByName(tag, "block_entities");
-    if (blockEntitiesTag && blockEntitiesTag->type == TagType::LIST) {
-        ProcessEntityBlocks(chunkX, chunkZ, blockEntitiesTag); 
-    }
-
-    // 提取所有子区块
-    auto sectionsTag = getChildByName(tag, "sections");
-    if (!sectionsTag || sectionsTag->type != TagType::LIST) {
-        return; // 没有子区块
-    }
-
-    // 遍历所有子区块
-    for (const auto& sectionTag : sectionsTag->children) {
-        int sectionY = -1;
-        auto yTag = getChildByName(sectionTag, "Y");
-        
-        if (yTag && yTag->type == TagType::BYTE) {
-            sectionY = static_cast<int>(yTag->payload[0]);
+        //提取实体方块
+        auto blockEntitiesTag = getChildByName(tag, "block_entities");
+        if (blockEntitiesTag && blockEntitiesTag->type == TagType::LIST) {
+            ProcessEntityBlocks(chunkX, chunkZ, blockEntitiesTag);
         }
 
-        // 处理子区块
-        ProcessSection(chunkX, chunkZ, sectionY, sectionTag);
+        // 提取所有子区块
+        auto sectionsTag = getChildByName(tag, "sections");
+        if (!sectionsTag || sectionsTag->type != TagType::LIST) {
+            return; // 没有子区块
+        }
+
+        // 遍历所有子区块 (仍在锁内, ProcessSection 内部注册调色板)
+        for (const auto& sectionTag : sectionsTag->children) {
+            int sectionY = -1;
+            auto yTag = getChildByName(sectionTag, "Y");
+
+            if (yTag && yTag->type == TagType::BYTE) {
+                sectionY = static_cast<int>(yTag->payload[0]);
+            }
+
+            // 处理子区块
+            ProcessSection(chunkX, chunkZ, sectionY, sectionTag);
+        }
     }
 }
 
@@ -758,8 +773,25 @@ int GetHeightMapY(int blockX, int blockZ, const std::string& heightMapType) {
     int chunkX, chunkZ;
     blockToChunk(blockX, blockZ, chunkX, chunkZ);
 
-    // 触发区块加载(确保高度图数据存在)
-    GetBlockId(blockX, 0, blockZ); // Y坐标任意,只为触发加载
+    // 确保高度图缓存存在(必要时重新加载区块以填充高度图)
+    {
+        std::shared_lock<std::shared_mutex> hm_lk(heightMapCacheMutex);
+        auto hmi = heightMapCache.find(std::make_pair(chunkX, chunkZ));
+        bool needLoad = (hmi == heightMapCache.end()) ||
+                        (hmi->second.find(heightMapType) == hmi->second.end());
+        if (needLoad) {
+            hm_lk.unlock();
+            // 仅在区块尚未加载时触发加载,避免递归
+            {
+                std::shared_lock<std::shared_mutex> sc_lk(sectionCacheMutex);
+                auto k0 = std::make_tuple(chunkX, chunkZ, 0);
+                if (sectionCache.find(k0) == sectionCache.end()) {
+                    sc_lk.unlock();
+                    LoadAndCacheBlockData(chunkX, chunkZ);
+                }
+            }
+        }
+    }
 
     // 查找缓存
     auto chunkKey = std::make_pair(chunkX, chunkZ);
@@ -866,11 +898,20 @@ int GetBlockLight(int blockX, int blockY, int blockZ) {
 }
 
 Block GetBlockById(int blockId) {
-    if (blockId >= 0 && blockId < globalBlockPalette.size()) {
-        return globalBlockPalette[blockId];
-    } else {
+    // LoadChunks 与模型线程分阶段执行。冻结后调色板不会扩容，多个模型线程
+    // 可安全并发读取，避免每个方块及其邻居都争抢同一把 mutex。
+    if (globalPaletteFrozen.load(std::memory_order_acquire)) {
+        if (blockId >= 0 && static_cast<size_t>(blockId) < globalBlockPalette.size()) {
+            return globalBlockPalette[blockId];
+        }
         return Block("minecraft:air", true);
     }
+
+    std::lock_guard<std::mutex> lock(globalPaletteMutex);
+    if (blockId >= 0 && static_cast<size_t>(blockId) < globalBlockPalette.size()) {
+        return globalBlockPalette[blockId];
+    }
+    return Block("minecraft:air", true);
 }
 
 
@@ -882,6 +923,7 @@ void InitializeGlobalBlockPalette() {
 }
 
 std::vector<Block> GetGlobalBlockPalette() {
+    std::lock_guard<std::mutex> lock(globalPaletteMutex);
     return globalBlockPalette;
 }
 

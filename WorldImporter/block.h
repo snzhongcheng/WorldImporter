@@ -3,6 +3,7 @@
 // C++ 标准库头文件
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <regex>
@@ -94,10 +95,20 @@ struct Block {
             for (const auto& fluidEntry : fluidDefinitions) {
                 const FluidInfo& info = fluidEntry.second;
                 if (info.liquid_blocks.count(baseName)) {
-                    fluidName = fluidEntry.first;
-                    level = 0;
-                    fluidProcessed = true;
-                    break;
+                    // liquid_blocks 表示通常自带流体的方块(海草/海带等)，但部分
+                    // 旧配置也把可含水方块(珊瑚等)放进了列表。若存档明确写了
+                    // waterlogged=false，必须尊重状态，不能强制生成水模型。
+                    bool explicitlyDry = false;
+                    if (!info.property.empty()) {
+                        auto propertyIt = states.find(info.property);
+                        explicitlyDry = propertyIt != states.end() && propertyIt->second == "false";
+                    }
+                    if (!explicitlyDry) {
+                        fluidName = fluidEntry.first;
+                        level = 0;
+                        fluidProcessed = true;
+                        break;
+                    }
                 }
             }
         }
@@ -425,6 +436,9 @@ struct SectionCacheEntry {
 };
 
 extern std::vector<Block> globalBlockPalette;
+// 全局方块名->调色板索引映射。与 globalBlockPalette 配套，必须全局唯一一份，
+// 由 globalPaletteMutex 保护（ProcessSection 与 ProcessEntityBlocks 并发注册）。
+extern std::unordered_map<std::string, int> globalBlockMap;
 extern std::unordered_map<std::tuple<int, int, int>, SectionCacheEntry, triple_hash> sectionCache;
 extern std::unordered_map<std::pair<int, int>, std::unordered_map<std::string, std::vector<int>>, pair_hash> heightMapCache;
 
@@ -433,6 +447,11 @@ extern std::shared_mutex sectionCacheMutex;
 
 // 保护 EntityBlockCache 与 heightMapCache 的读写
 extern std::shared_mutex chunkAuxCacheMutex;
+
+// 保护 globalBlockPalette 与 globalBlockMap (ProcessSection 并发注册)
+extern std::mutex globalPaletteMutex;
+// 模型生成阶段调色板只读，可绕过每方块一次的互斥锁。
+extern std::atomic<bool> globalPaletteFrozen;
 
 // 高度图类型
 static const std::vector<std::string> mapTypes = {"MOTION_BLOCKING", "MOTION_BLOCKING_NO_LEAVES",   "OCEAN_FLOOR", "WORLD_SURFACE"};

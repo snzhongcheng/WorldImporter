@@ -60,10 +60,12 @@ struct Config {
     bool activeLOD4; // 是否启用LOD4
     bool useBiomeColors; // 是否启用群系颜色叠加
     bool useRandomBlockModels; // 是否使用随机方块模型
+    bool importEntities; // 导出区域内生物/实体元数据
 
     bool exportFullModel;  // 是否完整导入
     int partitionSize; //分割大小
     size_t maxTasksPerBatch; //每批次区块任务数量上限
+    int modelThreads; //模型生成线程数(默认1，自动模式可提高)
 
     int decimalPlaces; //lod群系颜色值小数精度 #待做
     bool importByBlockType;  // 是否按方块种类导入 #待做
@@ -105,11 +107,12 @@ struct Config {
         lod1Blocks({}),
         useBiomeColors(true),
         useRandomBlockModels(true),
-        
+        importEntities(false),
 
         exportFullModel(false),
         partitionSize(4),
         maxTasksPerBatch(32768),
+        modelThreads(1),
 
         decimalPlaces(2),
         importByBlockType(false),

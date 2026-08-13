@@ -6,7 +6,9 @@
 #include <chrono>
 
 std::unordered_map<std::string, std::string> texturePathCache; // 定义材质路径缓存
+std::mutex texturePathCacheMutex;
 std::unordered_map<std::string, TextureDimension> textureDimensionCache; // 定义材质尺寸缓存
+std::mutex textureDimensionMutex;
 
 // PNG文件头部解析，读取图像尺寸
 bool GetPNGDimensions(const std::vector<unsigned char>& pngData, int& width, int& height) {

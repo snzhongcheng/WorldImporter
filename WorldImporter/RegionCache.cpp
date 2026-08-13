@@ -7,7 +7,8 @@
 #include <cstdint> // 用于 uint8_t, uint32_t
 #include <vector>
 #include "locutil.h"
-std::unordered_map<std::pair<int, int>, std::vector<char>, pair_hash> regionCache(1024);
+std::map<std::pair<int, int>, std::vector<char>> regionCache;
+std::mutex regionCacheMutex;
 
 // 将维度ID(如 minecraft:overworld)拆分为命名空间和名称两部分
 static void SplitDimensionId(const std::string& sel, std::string& ns, std::string& name) {
@@ -122,12 +123,15 @@ std::vector<char> ReadFileToMemory(const std::string& regionDirPath, int regionX
 
 const std::vector<char>& GetRegionFromCache(int regionX, int regionZ) {
     auto regionKey = std::make_pair(regionX, regionZ);
+    // 多线程首次访问不同 region 时并发 emplace 会损坏 unordered_map/map 结构,
+    // 必须加锁保护插入。std::map 插入新节点不会使已有节点的引用失效, 因此
+    // 锁内插入后, 锁外继续使用返回的引用是安全的。
+    std::lock_guard<std::mutex> lock(regionCacheMutex);
     auto it = regionCache.find(regionKey);
     if (it == regionCache.end()) {
         std::string regionDir = GetRegionDirectory();
         std::vector<char> fileData = ReadFileToMemory(regionDir, regionX, regionZ);
-        auto result = regionCache.emplace(regionKey, std::move(fileData));
-        it = result.first;
+        it = regionCache.emplace(regionKey, std::move(fileData)).first;
     }
     return it->second;
 }
