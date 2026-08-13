@@ -331,6 +331,7 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
         for (unsigned int t = 0; t < numThreads; ++t) {
             size_t start = t * chunk;
             size_t end = std::min(start + chunk, faceCount);
+            if (start >= end) continue; // 面数少于线程数时跳过空线程
             threads.emplace_back([&, start, end]() {
                 for (size_t i = start; i < end; ++i) {
                     const auto& vs = data.faces[i].vertexIndices;
@@ -371,6 +372,7 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
     for (unsigned int t = 0; t < numThreads2; ++t) {
         size_t startF = t * facesPerThread;
         size_t endF = std::min(startF + facesPerThread, faceCount);
+        if (startF >= endF) continue; // 面数少于线程数时跳过空线程，避免 size_t 下溢
         size_t batchSize = (endF - startF) * 4; // 每个面有4条边
         threadBatches[t].reserve(batchSize);
         

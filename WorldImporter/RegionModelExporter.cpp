@@ -245,116 +245,123 @@ void RegionModelExporter::ExportModels(const string& outputName) {
 
         for (unsigned i = 0; i < numThreads; ++i) {
             threads.emplace_back([&]() {
-                while (true) {
-                    size_t idx = groupIndex.fetch_add(1);
-                    if (idx >= groupsInBatch.size()) break;
-                    const auto& group = groupsInBatch[idx];
-                    ModelData groupModel;
-                    // 不再按整个大组的最坏情况一次预留（Face 约 40 字节，旧逻辑
-                    // 可能瞬间预留数百 MiB）。先预留最多 32 个任务，后续按需增长。
-                    const size_t reserveTasks = std::min<size_t>(group.tasks.size(), 32);
-                    groupModel.vertices.reserve(4096 * reserveTasks);
-                    groupModel.faces.reserve(8192 * reserveTasks);
-                    groupModel.uvCoordinates.reserve(4096 * reserveTasks);
-                    std::unordered_map<string, string> localMaterials;
-                    std::unordered_map<string, int8_t> localTints;
+                try {
+                    while (true) {
+                        size_t idx = groupIndex.fetch_add(1);
+                        if (idx >= groupsInBatch.size()) break;
+                        const auto& group = groupsInBatch[idx];
+                        ModelData groupModel;
+                        // 不再按整个大组的最坏情况一次预留（Face 约 40 字节，旧逻辑
+                        // 可能瞬间预留数百 MiB）。先预留最多 32 个任务，后续按需增长。
+                        const size_t reserveTasks = std::min<size_t>(group.tasks.size(), 32);
+                        groupModel.vertices.reserve(4096 * reserveTasks);
+                        groupModel.faces.reserve(8192 * reserveTasks);
+                        groupModel.uvCoordinates.reserve(4096 * reserveTasks);
+                        std::unordered_map<string, string> localMaterials;
+                        std::unordered_map<string, int8_t> localTints;
 
-                    // 记录当前组内需要处理的任务数
-                    size_t tasksInCurrentGroup = group.tasks.size();
-                    size_t processedInGroup = 0;
+                        // 记录当前组内需要处理的任务数
+                        size_t tasksInCurrentGroup = group.tasks.size();
+                        size_t processedInGroup = 0;
 
-                    // 合并组内所有区块模型
-                    for (const auto& task : group.tasks) {
-                        // 为当前区块生成生物群系地图数据 (如果尚未生成)
-                        std::pair<int, int> chunkKey = {task.chunkX, task.chunkZ};
-                        {
-                            std::lock_guard<std::mutex> lock(biomeMutex);
-                            if (processedBiomeChunks.find(chunkKey) == processedBiomeChunks.end()) {
-                                // 计算当前区块的方块坐标范围
-                                int blockXStart = task.chunkX * 16;
-                                int blockXEnd = blockXStart + 15;
-                                int blockZStart = task.chunkZ * 16;
-                                int blockZEnd = blockZStart + 15;
-                                // 确保区块数据已加载(填充高度图),再生成生物群系地图
-                                {
-                                    std::shared_lock<std::shared_mutex> sc_lk(sectionCacheMutex);
-                                    auto k0 = std::make_tuple(task.chunkX, task.chunkZ, 0);
-                                    bool needLoad = sectionCache.find(k0) == sectionCache.end();
-                                    sc_lk.unlock();
-                                    if (needLoad) {
-                                        LoadAndCacheBlockData(task.chunkX, task.chunkZ);
-                                    }
-                                }
-                                // 生成该区块的生物群系地图数据
-                                Biome::GenerateBiomeMap(blockXStart, blockZStart, blockXEnd, blockZEnd);
-                                processedBiomeChunks.insert(chunkKey);
-                            }
-                        }
-
-                        // processModel 返回可移动对象；提前 reserve 随即会被移动赋值
-                        // 丢弃，旧代码每个 section 都做了三次无效分配。
-                        ModelData chunkModel = processModel(task);
-                        if (groupModel.vertices.empty()) {
-                            groupModel = std::move(chunkModel);
-                        } else {
-                            MergeModelsDirectly(groupModel, chunkModel);
-                        }
-
-                        // 更新批次完成任务计数
-                        batchCompletedTasks.fetch_add(1);
-                        processedInGroup++;
-
-                        // 更新全局完成任务计数
-                        size_t globalCompleted = globalCompletedTasks.fetch_add(1) + 1;
-
-                        // 每100个任务或组内处理完成时才更新一次全局进度
-                        if (globalCompleted % 100 == 0 ||
-                            globalCompleted == totalTasksAllBatches ||
-                            processedInGroup == tasksInCurrentGroup) {
-
-                            // 使用互斥锁确保同一时间只有一个线程更新进度
+                        // 合并组内所有区块模型
+                        for (const auto& task : group.tasks) {
+                            // 为当前区块生成生物群系地图数据 (如果尚未生成)
+                            std::pair<int, int> chunkKey = {task.chunkX, task.chunkZ};
                             {
-                                std::lock_guard<std::mutex> progressLock(progressMutex);
-                                // 更新全局进度
-                                monitor.UpdateProgress("总体进度", globalCompleted, totalTasksAllBatches);
+                                std::lock_guard<std::mutex> lock(biomeMutex);
+                                if (processedBiomeChunks.find(chunkKey) == processedBiomeChunks.end()) {
+                                    // 计算当前区块的方块坐标范围
+                                    int blockXStart = task.chunkX * 16;
+                                    int blockXEnd = blockXStart + 15;
+                                    int blockZStart = task.chunkZ * 16;
+                                    int blockZEnd = blockZStart + 15;
+                                    // 确保区块数据已加载(填充高度图),再生成生物群系地图
+                                    {
+                                        std::shared_lock<std::shared_mutex> sc_lk(sectionCacheMutex);
+                                        auto k0 = std::make_tuple(task.chunkX, task.chunkZ, 0);
+                                        bool needLoad = sectionCache.find(k0) == sectionCache.end();
+                                        sc_lk.unlock();
+                                        if (needLoad) {
+                                            LoadAndCacheBlockData(task.chunkX, task.chunkZ);
+                                        }
+                                    }
+                                    // 生成该区块的生物群系地图数据
+                                    Biome::GenerateBiomeMap(blockXStart, blockZStart, blockXEnd, blockZEnd);
+                                    processedBiomeChunks.insert(chunkKey);
+                                }
+                            }
 
-                                // 同时显示当前批次进度
-                                size_t batchCompleted = batchCompletedTasks.load();
-                                std::string batchInfo = "批次 " + to_string(batchId) + "/" + to_string(totalBatches) +
-                                                      " (" + to_string(batchCompleted) + "/" + to_string(tasksInCurrentBatch) + ")";
-                                monitor.UpdateProgress("批次进度", batchCompleted, tasksInCurrentBatch, batchInfo);
+                            // processModel 返回可移动对象；提前 reserve 随即会被移动赋值
+                            // 丢弃，旧代码每个 section 都做了三次无效分配。
+                            ModelData chunkModel = processModel(task);
+                            if (groupModel.vertices.empty()) {
+                                groupModel = std::move(chunkModel);
+                            } else {
+                                MergeModelsDirectly(groupModel, chunkModel);
+                            }
+
+                            // 更新批次完成任务计数
+                            batchCompletedTasks.fetch_add(1);
+                            processedInGroup++;
+
+                            // 更新全局完成任务计数
+                            size_t globalCompleted = globalCompletedTasks.fetch_add(1) + 1;
+
+                            // 每100个任务或组内处理完成时才更新一次全局进度
+                            if (globalCompleted % 100 == 0 ||
+                                globalCompleted == totalTasksAllBatches ||
+                                processedInGroup == tasksInCurrentGroup) {
+
+                                // 使用互斥锁确保同一时间只有一个线程更新进度
+                                {
+                                    std::lock_guard<std::mutex> progressLock(progressMutex);
+                                    // 更新全局进度
+                                    monitor.UpdateProgress("总体进度", globalCompleted, totalTasksAllBatches);
+
+                                    // 同时显示当前批次进度
+                                    size_t batchCompleted = batchCompletedTasks.load();
+                                    std::string batchInfo = "批次 " + to_string(batchId) + "/" + to_string(totalBatches) +
+                                                          " (" + to_string(batchCompleted) + "/" + to_string(tasksInCurrentBatch) + ")";
+                                    monitor.UpdateProgress("批次进度", batchCompleted, tasksInCurrentBatch, batchInfo);
+                                }
                             }
                         }
-                    }
-                    if (groupModel.vertices.empty()) continue;
-                    for (const auto& mat : groupModel.materials)
-                        if (mat.tintIndex != -1) localTints[mat.name] = mat.tintIndex;
-                    if (config.exportFullModel) {
-                        mergeToFinalModel(std::move(groupModel));
-                    } else {
-                        // 去重处理
-                        {
-                            monitor.SetStatus(TaskStatus::DEDUPLICATING_VERTICES, "DeduplicateVertices");
-                            ModelDeduplicator::DeduplicateVertices(groupModel);
+                        if (groupModel.vertices.empty()) continue;
+                        for (const auto& mat : groupModel.materials)
+                            if (mat.tintIndex != -1) localTints[mat.name] = mat.tintIndex;
+                        if (config.exportFullModel) {
+                            mergeToFinalModel(std::move(groupModel));
+                        } else {
+                            // 去重处理
+                            {
+                                monitor.SetStatus(TaskStatus::DEDUPLICATING_VERTICES, "DeduplicateVertices");
+                                ModelDeduplicator::DeduplicateVertices(groupModel);
 
-                            monitor.SetStatus(TaskStatus::DEDUPLICATING_UV, "DeduplicateUV");
-                            ModelDeduplicator::DeduplicateUV(groupModel);
+                                monitor.SetStatus(TaskStatus::DEDUPLICATING_UV, "DeduplicateUV");
+                                ModelDeduplicator::DeduplicateUV(groupModel);
 
-                            monitor.SetStatus(TaskStatus::DEDUPLICATING_FACES, "DeduplicateFaces");
-                            ModelDeduplicator::DeduplicateFaces(groupModel);
+                                monitor.SetStatus(TaskStatus::DEDUPLICATING_FACES, "DeduplicateFaces");
+                                ModelDeduplicator::DeduplicateFaces(groupModel);
 
-                            if (config.useGreedyMesh) {
-                                monitor.SetStatus(TaskStatus::GREEDY_MESHING, "GreedyMesh");
-                                ModelDeduplicator::GreedyMesh(groupModel);
+                                if (config.useGreedyMesh) {
+                                    monitor.SetStatus(TaskStatus::GREEDY_MESHING, "GreedyMesh");
+                                    ModelDeduplicator::GreedyMesh(groupModel);
+                                }
                             }
-                        }
 
-                        const string groupFileName = outputName +
-                            "_x" + to_string(group.startX) +
-                            "_z" + to_string(group.startZ);
-                        CreateMultiModelFiles(groupModel, groupFileName, localMaterials, outputName);
-                        recordMaterials(localMaterials, localTints);
+                            const string groupFileName = outputName +
+                                "_x" + to_string(group.startX) +
+                                "_z" + to_string(group.startZ);
+                            CreateMultiModelFiles(groupModel, groupFileName, localMaterials, outputName);
+                            recordMaterials(localMaterials, localTints);
+                        }
                     }
+                } catch (const std::exception& e) {
+                    // 单个分组处理异常不应导致整个进程终止，跳过该组并记录错误
+                    std::cerr << "[ERROR] 组处理异常,已跳过当前组: " << e.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "[ERROR] 组处理未知异常,已跳过当前组" << std::endl;
                 }
             });
         }
