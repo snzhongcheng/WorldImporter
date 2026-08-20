@@ -14,3 +14,6 @@
 /build-*/
 /temp/
 /test-bbs-runtime/
+/AGENTS.md
+/build-bbs_err.txt
+*.err.txt
