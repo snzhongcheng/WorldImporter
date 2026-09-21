@@ -19,6 +19,9 @@
 #include <unordered_set>
 #include <array>
 #include <cstdint>
+#include <chrono>
+#include <cmath>
+#include <cstring>
 
 // ========= 规则索引 =========
 static std::vector<CtmRule> g_ctmRules;
@@ -626,6 +629,24 @@ static bool LoadCtmTilePixels(const std::string& ns, const std::string& tileRelP
     return true;
 }
 
+// 直接取 CTM tile 的原始 PNG 字节(不做解码/重编码, 保持与资源包完全一致)
+static bool LoadCtmTilePngBytes(const std::string& ns, const std::string& tileRelPath,
+    std::vector<unsigned char>& outBytes) {
+    std::shared_lock<std::shared_mutex> lock(GlobalCache::cacheMutex);
+    std::string indexKey = "ctmtextures:" + ns + ":" + tileRelPath;
+    auto idxIt = GlobalCache::ctmTexturesIndex.find(indexKey);
+    if (idxIt != GlobalCache::ctmTexturesIndex.end()) {
+        auto it = GlobalCache::ctmTextures.find(idxIt->second);
+        if (it != GlobalCache::ctmTextures.end()) { outBytes = it->second; return true; }
+    }
+    for (const auto& modId : GlobalCache::jarOrder) {
+        std::string cacheKey = modId + ":" + ns + ":" + tileRelPath;
+        auto it = GlobalCache::ctmTextures.find(cacheKey);
+        if (it != GlobalCache::ctmTextures.end()) { outBytes = it->second; return true; }
+    }
+    return false;
+}
+
 static bool LoadTexturePixels(const std::string& ns, const std::string& texturePath,
     std::vector<unsigned char>& outPixels, int& outW, int& outH) {
     std::vector<unsigned char> pngData;
@@ -752,22 +773,28 @@ static CtmTexInfo GetOrCreateTileTexInfo(const std::string& ns, const std::strin
     bool needSave = GetFileAttributesW(wfull.c_str()) == INVALID_FILE_ATTRIBUTES;
     bool saved = !needSave;
     if (needSave) {
-        std::vector<unsigned char> px; int w = 0, h = 0;
+        std::vector<unsigned char> pngBytes;
         // OptiFine 资源包 tile 命名有两种风格: 两位数字(01.png) 或 一位数字(1.png)
         // 先试两位, 再试一位, 都找不到再跳过
         bool loaded = false;
         std::string tileRel2 = baseDir + "/" + std::string(tileNameBuf);  // 两位
-        if (LoadCtmTilePixels(ns, tileRel2, px, w, h)) {
+        if (LoadCtmTilePngBytes(ns, tileRel2, pngBytes)) {
             loaded = true;
         }
         if (!loaded) {
             std::string tileRel1 = baseDir + "/" + std::to_string(tileIndex);  // 一位
-            if (LoadCtmTilePixels(ns, tileRel1, px, w, h)) {
+            if (LoadCtmTilePngBytes(ns, tileRel1, pngBytes)) {
                 loaded = true;
             }
         }
-        if (loaded) {
-            saved = stbi_write_png(fullPath.c_str(), w, h, 4, px.data(), w * 4) != 0;
+        if (loaded && !pngBytes.empty()) {
+            // 原始字节直写: 不做解码+stb 重编码
+            std::ofstream out(fullPath, std::ios::binary);
+            if (out.is_open()) {
+                out.write(reinterpret_cast<const char*>(pngBytes.data()), pngBytes.size());
+                out.close();
+                saved = true;
+            }
         }
     }
     info.saved = saved;
@@ -776,6 +803,175 @@ static CtmTexInfo GetOrCreateTileTexInfo(const std::string& ns, const std::strin
         g_ctmTexCache[id] = info;
     }
     return info;
+}
+
+// ========= 规则 atlas 合成 =========
+// 把一条规则的 N 个 tile 合成一张网格图, 面 UV 重映射到对应格子, 从而把
+// "一格一材质"降成"一条规则一材质", 大幅减少 Blender 导入时的材质/贴图数量
+// (OBJ 导入、建材质、pack_all 的开销都与数量成正比)。
+// 回退条件: tile 尺寸不一致, 或 tile 带 animation mcmeta(动画) → 保持逐格材质。
+struct CtmAtlasInfo {
+    CtmTexInfo tex;
+    int cols = 1;
+    int rows = 1;
+    bool valid = false;
+};
+
+static std::unordered_map<std::string, CtmAtlasInfo> g_ctmAtlasCache;
+
+// tile 像素读取(两位/一位文件名回退)
+static bool LoadCtmTilePixelsWithFallback(const std::string& ns, const std::string& baseDir,
+    int tileIndex, std::vector<unsigned char>& px, int& w, int& h) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d", tileIndex);
+    if (LoadCtmTilePixels(ns, baseDir + "/" + buf, px, w, h)) return true;
+    if (LoadCtmTilePixels(ns, baseDir + "/" + std::to_string(tileIndex), px, w, h)) return true;
+    return false;
+}
+
+// tile 是否带 animation mcmeta(动画 tile 不参与 atlas)
+static bool CtmTileHasAnimation(const std::string& ns, const std::string& baseDir, int tileIndex) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d", tileIndex);
+    const std::string rels[2] = { baseDir + "/" + buf, baseDir + "/" + std::to_string(tileIndex) };
+    std::shared_lock<std::shared_mutex> lock(GlobalCache::cacheMutex);
+    for (const auto& rel : rels) {
+        std::string idxKey = "mcmetas:" + ns + ":" + rel;
+        auto it = GlobalCache::mcmetaIndex.find(idxKey);
+        if (it == GlobalCache::mcmetaIndex.end()) continue;
+        auto m = GlobalCache::mcmetaCache.find(it->second);
+        if (m != GlobalCache::mcmetaCache.end()) return m->second.contains("animation");
+    }
+    return false;
+}
+
+// 按方法选择 atlas 网格(尽量贴近该方法的天然版式)
+static void GetAtlasGrid(const CtmRule& rule, int& cols, int& rows) {
+    const int n = static_cast<int>(rule.tiles.size());
+    switch (rule.method) {
+    case CtmMethod::Ctm:        cols = 12; rows = (n + 11) / 12; break;
+    case CtmMethod::Horizontal: cols = n;  rows = 1; break;
+    case CtmMethod::Vertical:   cols = 1;  rows = n; break;
+    case CtmMethod::Repeat:
+        cols = rule.width > 0 ? rule.width : 0;
+        rows = rule.height > 0 ? rule.height : 0;
+        if (cols * rows < n) { cols = 0; rows = 0; }
+        break;
+    case CtmMethod::Overlay:
+    case CtmMethod::OverlayHorizontal:
+        cols = 5; rows = (n + 4) / 5; break;
+    default: {
+        int c = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(n))));
+        if (c < 1) c = 1;
+        cols = c; rows = (n + c - 1) / c;
+        break;
+    }
+    }
+    if (cols <= 0 || rows <= 0) { cols = 1; rows = n; }
+    if (cols * rows < n) rows = (n + cols - 1) / cols;
+}
+
+static CtmAtlasInfo GetOrCreateRuleAtlas(const CtmRule& rule) {
+    CtmAtlasInfo result;
+    const int n = static_cast<int>(rule.tiles.size());
+    if (n <= 0) return result;
+
+    int cols = 1, rows = 1;
+    GetAtlasGrid(rule, cols, rows);
+
+    // 唯一签名: 网格 + tile 列表
+    std::string sig = "a" + std::to_string(cols) + "x" + std::to_string(rows);
+    for (int t : rule.tiles) sig += "_" + std::to_string(t);
+    std::string id = rule.ns + "|" + rule.baseDir + "|" + sig;
+    {
+        std::lock_guard<std::mutex> lk(g_ctmTexCacheMutex);
+        auto it = g_ctmAtlasCache.find(id);
+        if (it != g_ctmAtlasCache.end()) return it->second;
+    }
+
+    std::lock_guard<std::mutex> lkPng(g_ctmPngMutex);
+    {
+        std::lock_guard<std::mutex> lk2(g_ctmTexCacheMutex);
+        auto it = g_ctmAtlasCache.find(id);
+        if (it != g_ctmAtlasCache.end()) return it->second;
+    }
+
+    // 动画 tile 回退到逐格材质
+    for (int t : rule.tiles) {
+        if (CtmTileHasAnimation(rule.ns, rule.baseDir, t)) return result;
+    }
+
+    // 读取全部 tile, 要求尺寸一致
+    std::vector<std::vector<unsigned char>> pixels;
+    pixels.reserve(n);
+    int cellW = 0, cellH = 0;
+    for (int t : rule.tiles) {
+        std::vector<unsigned char> px; int w = 0, h = 0;
+        if (!LoadCtmTilePixelsWithFallback(rule.ns, rule.baseDir, t, px, w, h) || w <= 0 || h <= 0) {
+            return result;
+        }
+        if (cellW == 0) { cellW = w; cellH = h; }
+        else if (w != cellW || h != cellH) {
+            return result;  // 尺寸不一致, 回退
+        }
+        pixels.push_back(std::move(px));
+    }
+
+    const int outW = cols * cellW;
+    const int outH = rows * cellH;
+    std::vector<unsigned char> out(static_cast<size_t>(outW) * outH * 4, 0);
+    for (int i = 0; i < n; ++i) {
+        const int col = i % cols;
+        const int row = i / cols;
+        const std::vector<unsigned char>& src = pixels[i];
+        for (int yy = 0; yy < cellH; ++yy) {
+            const unsigned char* srcRow = src.data() + static_cast<size_t>(yy) * cellW * 4;
+            unsigned char* dstRow = out.data() +
+                (static_cast<size_t>(row) * cellH + yy) * outW * 4 + static_cast<size_t>(col) * cellW * 4;
+            std::memcpy(dstRow, srcRow, static_cast<size_t>(cellW) * 4);
+        }
+    }
+
+    std::string fileName = "atlas_" + std::to_string(cols) + "x" + std::to_string(rows) + "_" +
+        std::to_string(std::hash<std::string>{}(sig));
+    std::string fullPath = BuildCtmTextureFilePath(rule.ns, rule.baseDir, fileName);
+    result.tex.materialName = BuildCtmMaterialName(rule.ns, rule.baseDir, fileName);
+    result.tex.texturePath = BuildCtmTextureRelPath(rule.ns, rule.baseDir, fileName);
+    result.cols = cols;
+    result.rows = rows;
+    result.tex.saved = stbi_write_png(fullPath.c_str(), outW, outH, 4, out.data(), outW * 4) != 0;
+    if (result.tex.saved) {
+        result.valid = true;
+        std::lock_guard<std::mutex> lk2(g_ctmTexCacheMutex);
+        g_ctmAtlasCache[id] = result;
+    }
+    return result;
+}
+
+// 规则指针稳定(g_ctmRules 初始化后不再变动), 按指针做线程内缓存,
+// 避免每面重复构建签名/查表。
+static const CtmAtlasInfo& GetRuleAtlasCached(const CtmRule* rule) {
+    static thread_local std::unordered_map<const CtmRule*, CtmAtlasInfo> cache;
+    auto it = cache.find(rule);
+    if (it != cache.end()) return it->second;
+    CtmAtlasInfo info = GetOrCreateRuleAtlas(*rule);
+    return cache.emplace(rule, std::move(info)).first->second;
+}
+
+// 把面的 UV 映射到 atlas 的第 (col,row) 格(行 0 在图像顶部)
+static void RemapFaceUvToAtlas(ModelData& model, Face& face, int col, int row, int cols, int rows) {
+    for (int i = 0; i < 4; ++i) {
+        int uvIdx = face.uvIndices[i];
+        if (uvIdx < 0 || uvIdx * 2 + 1 >= static_cast<int>(model.uvCoordinates.size())) continue;
+        float u = model.uvCoordinates[uvIdx * 2];
+        float v = model.uvCoordinates[uvIdx * 2 + 1];
+        float nu = (u + static_cast<float>(col)) / static_cast<float>(cols);
+        float nv = (v + static_cast<float>(rows - 1 - row)) / static_cast<float>(rows);
+        int newIdx = static_cast<int>(model.uvCoordinates.size()) / 2;
+        model.uvCoordinates.push_back(nu);
+        model.uvCoordinates.push_back(nv);
+        face.uvIndices[i] = newIdx;
+    }
 }
 
 // ========= ctm_compact 合成 =========
@@ -1365,6 +1561,25 @@ void ApplyCtmToBlockModel(ModelData& model,
 
         CtmTexInfo info;
         bool got = false;
+        // atlas: 一条规则只出一个材质, 面 UV 映射到对应格子
+        bool useAtlas = false;
+        const CtmAtlasInfo* atlasInfo = nullptr;
+        int atlasSel = -1;
+        std::string chainMaterialName;  // atlas 模式下用于 overlay 链式查找的逐格材质名
+        auto useTile = [&](const CtmRule& r, int tilePos) -> CtmTexInfo {
+            if (tilePos < 0 || tilePos >= static_cast<int>(r.tiles.size())) return CtmTexInfo();
+            const CtmAtlasInfo& ai = GetRuleAtlasCached(&r);
+            if (ai.valid) {
+                atlasInfo = &ai;
+                atlasSel = tilePos;
+                useAtlas = true;
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%02d", r.tiles[tilePos]);
+                chainMaterialName = BuildCtmMaterialName(r.ns, r.baseDir, buf);
+                return ai.tex;
+            }
+            return GetOrCreateTileTexInfo(r.ns, r.baseDir, r.tiles[tilePos]);
+        };
         auto overlayRules = FindOverlayRules(ns, baseBlockName, matNs, textureName);
         const CtmRule* rule = FindCtmRule(ns, baseBlockName, matNs, textureName);
         if (rule && !CtmRuleMatchesFace(*rule, ftn)) rule = nullptr;
@@ -1386,7 +1601,7 @@ void ApplyCtmToBlockModel(ModelData& model,
         case CtmMethod::Horizontal: {
             int sel = SelectHorizontalTile(L, x, y, z, curBaseName);
             if (sel < (int)rule->tiles.size()) {
-                info = GetOrCreateTileTexInfo(rule->ns, rule->baseDir, rule->tiles[sel]);
+                info = useTile(*rule, sel);
                 got = info.saved;
             }
             break;
@@ -1394,7 +1609,7 @@ void ApplyCtmToBlockModel(ModelData& model,
         case CtmMethod::Vertical: {
             int sel = SelectVerticalTile(L, x, y, z, curBaseName);
             if (sel < (int)rule->tiles.size()) {
-                info = GetOrCreateTileTexInfo(rule->ns, rule->baseDir, rule->tiles[sel]);
+                info = useTile(*rule, sel);
                 got = info.saved;
             }
             break;
@@ -1402,25 +1617,25 @@ void ApplyCtmToBlockModel(ModelData& model,
         case CtmMethod::Ctm: {
             int sel = SelectCtmTile(L, x, y, z, curBaseName);
             if (sel < (int)rule->tiles.size()) {
-                info = GetOrCreateTileTexInfo(rule->ns, rule->baseDir, rule->tiles[sel]);
+                info = useTile(*rule, sel);
                 got = info.saved;
             }
             break;
         }
         case CtmMethod::Fixed:
-            info = GetOrCreateTileTexInfo(rule->ns, rule->baseDir, rule->tiles.front());
+            info = useTile(*rule, 0);
             got = info.saved;
             break;
         case CtmMethod::Top:
             if (IsTopConnected(ft, blockName, x, y, z, curBaseName)) {
-                info = GetOrCreateTileTexInfo(rule->ns, rule->baseDir, rule->tiles.front());
+                info = useTile(*rule, 0);
                 got = info.saved;
             }
             break;
         case CtmMethod::Random: {
             int sel = SelectRandomTile(*rule, ft, x, y, z, curBaseName);
             if (sel >= 0 && sel < static_cast<int>(rule->tiles.size())) {
-                info = GetOrCreateTileTexInfo(rule->ns, rule->baseDir, rule->tiles[sel]);
+                info = useTile(*rule, sel);
                 got = info.saved;
             }
             break;
@@ -1429,7 +1644,7 @@ void ApplyCtmToBlockModel(ModelData& model,
             int orientation = rule->orient == "texture" ? GetTextureOrientation(model, face, ft) : 0;
             int sel = SelectRepeatTile(ft, x, y, z, rule->width, rule->height, orientation);
             if (sel >= 0 && sel < (int)rule->tiles.size()) {
-                info = GetOrCreateTileTexInfo(rule->ns, rule->baseDir, rule->tiles[sel]);
+                info = useTile(*rule, sel);
                 got = info.saved;
             }
             break;
@@ -1452,7 +1667,7 @@ void ApplyCtmToBlockModel(ModelData& model,
             face.materialIndex = getOrAddMaterial(info);
             // overlay 的 matchTiles 可能指向前一条 CTM 规则产生的 tile。
             // 生成材质名形如 ns:ctm/optifine/.../t7，将其还原为 optifine/.../7 再查一次。
-            std::string resolved = info.materialName;
+            std::string resolved = chainMaterialName.empty() ? info.materialName : chainMaterialName;
             size_t colon = resolved.find(':');
             std::string rns = colon == std::string::npos ? matNs : resolved.substr(0, colon);
             std::string rpath = colon == std::string::npos ? resolved : resolved.substr(colon + 1);
@@ -1469,11 +1684,29 @@ void ApplyCtmToBlockModel(ModelData& model,
         // Overlay 保留基础面，再追加一层带透明 PNG 的轻微外移面。
         for (const CtmRule* overlay : overlayRules) {
             if (!CtmRuleMatchesFace(*overlay, ftn)) continue;
+            const CtmAtlasInfo& overlayAtlas = GetRuleAtlasCached(overlay);
             for (int tilePos : SelectOverlayTiles(*overlay, L, x, y, z)) {
                 if (tilePos < 0 || tilePos >= static_cast<int>(overlay->tiles.size())) continue;
-                CtmTexInfo oi = GetOrCreateTileTexInfo(overlay->ns, overlay->baseDir, overlay->tiles[tilePos]);
-                if (oi.saved) pendingOverlays.push_back({face, ft, getOrAddMaterial(oi)});
+                Face overlayFace = face;
+                CtmTexInfo oi;
+                if (overlayAtlas.valid) {
+                    oi = overlayAtlas.tex;
+                    RemapFaceUvToAtlas(model, overlayFace,
+                        tilePos % overlayAtlas.cols, tilePos / overlayAtlas.cols,
+                        overlayAtlas.cols, overlayAtlas.rows);
+                }
+                else {
+                    oi = GetOrCreateTileTexInfo(overlay->ns, overlay->baseDir, overlay->tiles[tilePos]);
+                }
+                if (oi.saved) pendingOverlays.push_back({overlayFace, ft, getOrAddMaterial(oi)});
             }
+        }
+
+        // 基础面若用了 atlas, 在 overlay 面拷贝完成后再重映射 UV
+        if (got && useAtlas && atlasInfo) {
+            RemapFaceUvToAtlas(model, face,
+                atlasSel % atlasInfo->cols, atlasSel / atlasInfo->cols,
+                atlasInfo->cols, atlasInfo->rows);
         }
         t_activeRule = nullptr;
     }
