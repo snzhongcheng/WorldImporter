@@ -314,27 +314,53 @@ ModelData GetRandomModelFromCache(const std::string& namespaceName, const std::s
 // 此方法会处理对应的json文件 
 // 然后计算出方块的模型数据存储在BlockModelCache / VariantModelCache / MultipartModelCache 里面
 // 你可以使用 GetRandomModelFromCache 方法来获取模型
+// 快速解析 "k=v,k=v" 形式的字符串（替代正则/stringstream，热路径）
+static void ParseConditionInto(const std::string& input, std::unordered_map<std::string, std::string>& out) {
+    size_t i = 0;
+    while (i < input.size()) {
+        size_t comma = input.find(',', i);
+        size_t end = (comma == std::string::npos) ? input.size() : comma;
+        size_t eq = input.find('=', i);
+        if (eq != std::string::npos && eq < end && eq > i && end > eq + 1) {
+            out[input.substr(i, eq - i)] = input.substr(eq + 1, end - eq - 1);
+        }
+        i = end + 1;
+    }
+}
+
+// variant key 的所有键值对是否都满足 condition（等价于旧的
+// IsSubset(ParseKeyValuePairs(SortedVariantKey(variant)), ParseKeyValuePairs(SortedVariantKey(condition)))）
+static bool VariantKeyMatches(const std::string& variantKey,
+    const std::unordered_map<std::string, std::string>& conditionMap) {
+    size_t i = 0;
+    while (i < variantKey.size()) {
+        size_t comma = variantKey.find(',', i);
+        size_t end = (comma == std::string::npos) ? variantKey.size() : comma;
+        size_t eq = variantKey.find('=', i);
+        if (eq != std::string::npos && eq < end) {
+            auto it = conditionMap.find(variantKey.substr(i, eq - i));
+            if (it == conditionMap.end()) return false;
+            if (it->second != variantKey.substr(eq + 1, end - eq - 1)) return false;
+        }
+        i = end + 1;
+    }
+    return true;
+}
+
 void ProcessBlockstate(const std::string& namespaceName, const std::vector<std::string>& blockIds) {
     for (const auto& blockId : blockIds) {
         // 解析 blockId 和条件
-        static const std::regex blockIdRegex(R"(^(.*?)\[(.*)\]$)");
-        std::smatch match;
         std::string baseBlockId = blockId;
         std::string condition;
         std::unordered_map<std::string, std::string> blockConditions;
         std::string blockstateName = namespaceName + ":" + blockId;
 
-        if (std::regex_match(blockId, match, blockIdRegex)) {
-            baseBlockId = match.str(1);
-            condition = match.str(2);
-
-            static const std::regex conditionRegex(R"((\w+)=([^,]+))");
-            auto conditionsBegin = std::sregex_iterator(condition.begin(), condition.end(), conditionRegex);
-            auto conditionsEnd = std::sregex_iterator();
-
-            for (auto i = conditionsBegin; i != conditionsEnd; ++i) {
-                std::smatch submatch = *i;
-                blockConditions[submatch[1].str()] = submatch[2].str();
+        if (!blockId.empty() && blockId.back() == ']') {
+            size_t lb = blockId.find('[');
+            if (lb != std::string::npos) {
+                baseBlockId = blockId.substr(0, lb);
+                condition = blockId.substr(lb + 1, blockId.size() - lb - 2);
+                ParseConditionInto(condition, blockConditions);
             }
         }
 
@@ -353,15 +379,10 @@ void ProcessBlockstate(const std::string& namespaceName, const std::vector<std::
         if (blockstateJson.contains("variants")) {
             for (auto& variant : blockstateJson["variants"].items()) {
                 std::string variantKey = variant.key();
-                std::string normalizedCondition = SortedVariantKey(condition);
-                std::string normalizedVariantKey = SortedVariantKey(variantKey);
+                bool matched = condition.empty() || VariantKeyMatches(variantKey, blockConditions);
 
-                // 解析为键值对
-                auto conditionMap = ParseKeyValuePairs(normalizedCondition);
-                auto variantMap = ParseKeyValuePairs(normalizedVariantKey);
-
-                // 判断条件:variantMap 的所有键值对需存在于 conditionMap 中
-                if (condition.empty() || IsSubset(variantMap, conditionMap)) {
+                // 判断条件:variant 的所有键值对需存在于 condition 中
+                if (matched) {
                     int rotationX = 0, rotationY = 0;
                     bool uvlock = false;
 
