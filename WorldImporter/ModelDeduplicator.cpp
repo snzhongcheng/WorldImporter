@@ -495,7 +495,56 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
     // 4. UV 连续性检查 (Lambda定义)
     enum UVAxis { NONE=0, HORIZONTAL=1, VERTICAL=2 };
     auto checkUV = [&](int fi){
-        const auto& uvs_indices = data.faces[fi].uvIndices;
+        const auto& face_uv = data.faces[fi];
+        const auto& uvs_indices = face_uv.uvIndices;
+        // 周期 atlas 材质(repeat): UV 落在格子内部, 以"格子矩形"作为边界基准;
+        // 仅接受恰好覆盖整格的面, 其余(非整格 UV)不参与合并。
+        float left = 0.0f, right = 1.0f, bottom = 0.0f, top = 1.0f;
+        if (face_uv.materialIndex >= 0 && (size_t)face_uv.materialIndex < data.materials.size()) {
+            const Material& mat = data.materials[face_uv.materialIndex];
+            if (mat.uvAtlas && !mat.uvPeriodic) {
+                // 非周期 atlas(ctm/random/horizontal/...): 只有整图即一格(1x1)
+                // 才能按普通贴图合并; 其余格子面一律不参与(跨格合并会贴错图)。
+                if (mat.uvCellW < 1.0f - eps || mat.uvCellH < 1.0f - eps) return NONE;
+            }
+            if (mat.uvPeriodic) {
+                // 面必须近似 1x1 格: 台阶侧面等半格面每格 UV 推进速率不同,
+                // 合并后必然错位, 一律不参与合并。
+                {
+                    float mn[3] = { 1e30f, 1e30f, 1e30f };
+                    float mx[3] = { -1e30f, -1e30f, -1e30f };
+                    for (int j = 0; j < 4; ++j) {
+                        int vi = face_uv.vertexIndices[j];
+                        if (vi < 0 || (size_t)(vi * 3 + 2) >= data.vertices.size()) return NONE;
+                        for (int a = 0; a < 3; ++a) {
+                            float c = data.vertices[vi * 3 + a];
+                            mn[a] = std::min(mn[a], c);
+                            mx[a] = std::max(mx[a], c);
+                        }
+                    }
+                    float ext[3] = { mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2] };
+                    std::sort(ext, ext + 3);
+                    if (std::fabs(ext[1] - 1.0f) > 1e-3f || std::fabs(ext[2] - 1.0f) > 1e-3f) return NONE;
+                }
+                float uMin = 0.0f, uMax = 0.0f, vMin = 0.0f, vMax = 0.0f;
+                bool first = true;
+                for (int j = 0; j < 4; ++j) {
+                    if (uvs_indices[j] < 0 || (uvs_indices[j] * 2 + 1) >= data.uvCoordinates.size()) {
+                        return NONE;
+                    }
+                    float u = data.uvCoordinates[2 * uvs_indices[j]];
+                    float v = data.uvCoordinates[2 * uvs_indices[j] + 1];
+                    if (first) { uMin = uMax = u; vMin = vMax = v; first = false; }
+                    else {
+                        uMin = std::min(uMin, u); uMax = std::max(uMax, u);
+                        vMin = std::min(vMin, v); vMax = std::max(vMax, v);
+                    }
+                }
+                if (std::fabs((uMax - uMin) - mat.uvCellW) > eps) return NONE;
+                if (std::fabs((vMax - vMin) - mat.uvCellH) > eps) return NONE;
+                left = uMin; right = uMax; bottom = vMin; top = vMax;
+            }
+        }
         int cntTop=0, cntBottom=0, cntLeft=0, cntRight=0;
         for (int j=0;j<4;++j) {
             if (uvs_indices[j] < 0 || (uvs_indices[j] * 2 + 1) >= data.uvCoordinates.size()) {
@@ -503,10 +552,10 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
             }
             float u = data.uvCoordinates[2*uvs_indices[j]];
             float v = data.uvCoordinates[2*uvs_indices[j]+1];
-            if (std::fabs(v-1.0f)<eps) ++cntTop;
-            if (std::fabs(v)<eps) ++cntBottom;
-            if (std::fabs(u)<eps) ++cntLeft;
-            if (std::fabs(u-1.0f)<eps) ++cntRight;
+            if (std::fabs(v-top)<eps) ++cntTop;
+            if (std::fabs(v-bottom)<eps) ++cntBottom;
+            if (std::fabs(u-left)<eps) ++cntLeft;
+            if (std::fabs(u-right)<eps) ++cntRight;
         }
         if (cntTop==2 && cntBottom==2) return VERTICAL;
         if (cntLeft==2 && cntRight==2) return HORIZONTAL;
@@ -585,13 +634,26 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
 
         int i0 = grp_indices[0];
         const Face& f0_group_base = data.faces[i0];
+        const Material& groupMat = data.materials[f0_group_base.materialIndex];
         Vector3 N0_group_base = faceNormals[i0];
         Vector3 arbi_group_base = std::fabs(N0_group_base.x)>std::fabs(N0_group_base.z)? Vector3{0,0,1}:Vector3{1,0,0};
         Vector3 T1_group_base = normalize(cross(arbi_group_base,N0_group_base));
         Vector3 T2_group_base = normalize(cross(N0_group_base,T1_group_base));
         Vector3 P0_group_base = getVertex(f0_group_base.vertexIndices[0]);
         
-        struct Entry { float minW, maxW, minH, maxH; float uMin, uMax, vMin, vMax; int rotation; std::array<int,4> vids; int originalFaceIndex; };
+        struct Entry {
+            float minW, maxW, minH, maxH;
+            float uMin, uMax, vMin, vMax;
+            int rotation;
+            std::array<int,4> vids;
+            int originalFaceIndex;
+            // 周期 atlas: 锚点仿射映射 (世界投影 (W,H) -> UV), 合并后用它重算 UV
+            bool  anchorValid = false;
+            float anchorW = 0.0f, anchorH = 0.0f;
+            float anchorU = 0.0f, anchorV = 0.0f;
+            float stepW_u = 0.0f, stepW_v = 0.0f;
+            float stepH_u = 0.0f, stepH_v = 0.0f;
+        };
         std::vector<Entry> entries;
         entries.reserve(grp_indices.size());
 
@@ -643,6 +705,41 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
                     e.rotation = (dotWx_Ux >= 0) ? 0 : 180;
                 } else {
                     e.rotation = (dotWx_Uy >= 0) ? 90 : 270;
+                }
+            }
+            // 周期 atlas: 从该面自身的顶点/UV 对应关系推出"世界 (W,H) -> UV"
+            // 的仿射映射(每格步进)。合并后按世界坐标重排 UV, 天然覆盖
+            // 旋转/镜像 UV, 且与合并顺序无关。
+            if (groupMat.uvPeriodic && uv_valid_for_rotation) {
+                Vector2 eA{ pts_proj[1].x - pts_proj[0].x, pts_proj[1].y - pts_proj[0].y };
+                Vector2 eB{ pts_proj[3].x - pts_proj[0].x, pts_proj[3].y - pts_proj[0].y };
+                Vector2 dA{ uvs_rot_calc[1].x - uvs_rot_calc[0].x, uvs_rot_calc[1].y - uvs_rot_calc[0].y };
+                Vector2 dB{ uvs_rot_calc[3].x - uvs_rot_calc[0].x, uvs_rot_calc[3].y - uvs_rot_calc[0].y };
+                const float axisEps = 1e-3f;
+                bool ok = false;
+                if (std::fabs(eA.x) > std::fabs(eA.y) + axisEps) {
+                    // A 沿 W, B 沿 H
+                    ok = std::fabs(eA.y) < axisEps && std::fabs(eB.x) < axisEps &&
+                         std::fabs(eA.x) > axisEps && std::fabs(eB.y) > axisEps;
+                    if (ok) {
+                        e.stepW_u = dA.x / eA.x; e.stepW_v = dA.y / eA.x;
+                        e.stepH_u = dB.x / eB.y; e.stepH_v = dB.y / eB.y;
+                    }
+                } else if (std::fabs(eA.y) > std::fabs(eA.x) + axisEps) {
+                    // A 沿 H, B 沿 W
+                    ok = std::fabs(eA.x) < axisEps && std::fabs(eB.y) < axisEps &&
+                         std::fabs(eA.y) > axisEps && std::fabs(eB.x) > axisEps;
+                    if (ok) {
+                        e.stepH_u = dA.x / eA.y; e.stepH_v = dA.y / eA.y;
+                        e.stepW_u = dB.x / eB.x; e.stepW_v = dB.y / eB.x;
+                    }
+                }
+                if (ok) {
+                    e.anchorValid = true;
+                    e.anchorW = pts_proj[0].x;
+                    e.anchorH = pts_proj[0].y;
+                    e.anchorU = uvs_rot_calc[0].x;
+                    e.anchorV = uvs_rot_calc[0].y;
                 }
             }
             entries.push_back(e);
@@ -805,18 +902,29 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
                 float du_final = e_final.uMax - e_final.uMin;
                 float dv_final = e_final.vMax - e_final.vMin;
                 for(int k_uv=0; k_uv < 4; ++k_uv) {
-                    float fw_uv = (k_uv == 1 || k_uv == 2) ? 1.0f : 0.0f;
-                    float fh_uv = (k_uv >= 2) ? 1.0f : 0.0f;
-                    float lu_uv, lv_uv;
-                    switch (e_final.rotation) {
-                        case 0:   lu_uv = fw_uv;             lv_uv = fh_uv;             break;
-                        case 90:  lu_uv = fh_uv;             lv_uv = 1.0f - fw_uv;      break;
-                        case 180: lu_uv = 1.0f - fw_uv;      lv_uv = 1.0f - fh_uv;      break;
-                        case 270: lu_uv = 1.0f - fh_uv;      lv_uv = fw_uv;             break;
-                        default:  lu_uv = fw_uv;             lv_uv = fh_uv;             break;
+                    float w_uv = (k_uv == 0 || k_uv == 3) ? e_final.minW : e_final.maxW;
+                    float h_uv = (k_uv == 0 || k_uv == 1) ? e_final.minH : e_final.maxH;
+                    float u_final, v_final;
+                    if (e_final.anchorValid) {
+                        // 周期 atlas: 按锚点仿射映射从世界坐标重算 UV
+                        u_final = e_final.anchorU + e_final.stepW_u * (w_uv - e_final.anchorW)
+                                                 + e_final.stepH_u * (h_uv - e_final.anchorH);
+                        v_final = e_final.anchorV + e_final.stepW_v * (w_uv - e_final.anchorW)
+                                                 + e_final.stepH_v * (h_uv - e_final.anchorH);
+                    } else {
+                        float fw_uv = (k_uv == 1 || k_uv == 2) ? 1.0f : 0.0f;
+                        float fh_uv = (k_uv >= 2) ? 1.0f : 0.0f;
+                        float lu_uv, lv_uv;
+                        switch (e_final.rotation) {
+                            case 0:   lu_uv = fw_uv;             lv_uv = fh_uv;             break;
+                            case 90:  lu_uv = fh_uv;             lv_uv = 1.0f - fw_uv;      break;
+                            case 180: lu_uv = 1.0f - fw_uv;      lv_uv = 1.0f - fh_uv;      break;
+                            case 270: lu_uv = 1.0f - fh_uv;      lv_uv = fw_uv;             break;
+                            default:  lu_uv = fw_uv;             lv_uv = fh_uv;             break;
+                        }
+                        u_final = e_final.uMin + lu_uv * du_final;
+                        v_final = e_final.vMin + lv_uv * dv_final;
                     }
-                    float u_final = e_final.uMin + lu_uv * du_final;
-                    float v_final = e_final.vMin + lv_uv * dv_final;
                     res.uvCoords.push_back(u_final);
                     res.uvCoords.push_back(v_final);
                 }

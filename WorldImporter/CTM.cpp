@@ -42,6 +42,11 @@ struct CtmTexInfo {
     std::string materialName;   // 例如 minecraft:ctm/optifine/ctm/glass/glass/m123
     std::string texturePath;    // 相对路径,例如 textures/minecraft/ctm/.../m123.png
     bool saved = false;
+    // 周期 atlas(repeat): 面 UV 按世界坐标周期排列, 贪心合并可跨格扩展
+    bool atlas = false;         // 该材质是 atlas(非整图)
+    bool periodic = false;
+    float cellW = 0.0f;
+    float cellH = 0.0f;
 };
 static std::unordered_map<std::string, CtmTexInfo> g_ctmTexCache;
 static std::mutex g_ctmTexCacheMutex;
@@ -939,6 +944,16 @@ static CtmAtlasInfo GetOrCreateRuleAtlas(const CtmRule& rule) {
     result.tex.texturePath = BuildCtmTextureRelPath(rule.ns, rule.baseDir, fileName);
     result.cols = cols;
     result.rows = rows;
+    result.tex.atlas = true;
+    result.tex.cellW = 1.0f / static_cast<float>(cols);
+    result.tex.cellH = 1.0f / static_cast<float>(rows);
+    // repeat 且网格与 width*height 一致时, 图案按世界坐标周期排列:
+    // 贪心合并可跨格扩展 UV, 由纹理 REPEAT 回绕, 合并后仍逐格正确。
+    if (rule.method == CtmMethod::Repeat && rule.orient != "texture" &&
+        cols == rule.width && rows == rule.height &&
+        n == rule.width * rule.height && cols > 0 && rows > 0) {
+        result.tex.periodic = true;
+    }
     result.tex.saved = stbi_write_png(fullPath.c_str(), outW, outH, 4, out.data(), outW * 4) != 0;
     if (result.tex.saved) {
         result.valid = true;
@@ -1525,6 +1540,10 @@ void ApplyCtmToBlockModel(ModelData& model,
         m.tintIndex = -1;
         m.type = NORMAL;
         m.aspectRatio = 1.0f;
+        m.uvAtlas = info.atlas;
+        m.uvPeriodic = info.periodic;
+        m.uvCellW = info.cellW;
+        m.uvCellH = info.cellH;
         int idx = (int)model.materials.size();
         model.materials.push_back(m);
         localCtmMatIndex[info.materialName] = idx;

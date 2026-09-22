@@ -38,7 +38,13 @@ struct Material {
     int8_t  tintIndex;      // tint 索引
     MaterialType type;      // 材质类型
     float aspectRatio;      // 动态材质长宽比（高/宽）
-    
+    // 周期 atlas 材质(仅 repeat CTM): 面 UV 落在 atlas 格子里, 且格子按世界
+    // 坐标周期排列。贪心合并时可跨格扩展 UV, 由纹理 REPEAT 回绕。
+    bool  uvAtlas = false;      // 该材质是一张 atlas(非整图贴图)
+    bool  uvPeriodic = false;
+    float uvCellW = 0.0f;   // 一格在 UV 空间的宽度 (1/cols)
+    float uvCellH = 0.0f;   // 一格在 UV 空间的高度 (1/rows)
+
     // 构造函数,默认为普通材质
     Material() : name(""), texturePath(""), tintIndex(-1), type(NORMAL), aspectRatio(1.0f) {}
     Material(const std::string& name, const std::string& path, int8_t tint) 
