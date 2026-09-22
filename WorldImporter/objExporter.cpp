@@ -473,7 +473,7 @@ void createObjFile(const ModelData& data, const std::string& objName, const std:
     }
 }
 
-void CreateSharedMtlFile(std::unordered_map<std::string, std::string> uniqueMaterials, const std::string& mtlFileName, const std::unordered_map<std::string, int8_t>& uniqueTints) {
+void CreateSharedMtlFile(std::unordered_map<std::string, std::string> uniqueMaterials, const std::string& mtlFileName, const std::unordered_map<std::string, TintResult>& uniqueTints) {
     std::string exeDir = getExecutableDir();
     std::string fullMtlPath = exeDir + mtlFileName + ".mtl";
 
@@ -564,6 +564,47 @@ void CreateSharedMtlFile(std::unordered_map<std::string, std::string> uniqueMate
     }
     else {
         std::cerr << "Failed to create .mtl file: " << mtlFileName << std::endl;
+    }
+
+    CreateTintJsonFile(uniqueTints);
+}
+
+namespace {
+    float SrgbChannelToLinear(uint32_t channel) {
+        float s = static_cast<float>(channel & 0xFF) / 255.0f;
+        return (s <= 0.04045f) ? (s / 12.92f) : std::pow((s + 0.055f) / 1.055f, 2.4f);
+    }
+}
+
+// 输出 tint.json（材质名 -> {kind, color?}；无 kind 表示不上色），供 Blender 插件按接口接线
+void CreateTintJsonFile(const std::unordered_map<std::string, TintResult>& uniqueTints) {
+    if (uniqueTints.empty()) return;
+
+    nlohmann::json root = nlohmann::json::object();
+    for (const auto& entry : uniqueTints) {
+        const TintResult& tint = entry.second;
+        nlohmann::json value = nlohmann::json::object();
+        if (tint.on()) {
+            value["kind"] = TintKindName(tint.kind);
+            if (tint.kind == TintKind::Fixed) {
+                nlohmann::json color = nlohmann::json::array();
+                color.push_back(SrgbChannelToLinear((tint.color >> 16) & 0xFF));
+                color.push_back(SrgbChannelToLinear((tint.color >> 8) & 0xFF));
+                color.push_back(SrgbChannelToLinear(tint.color & 0xFF));
+                value["color"] = std::move(color);
+            }
+        }
+        root[entry.first] = std::move(value);
+    }
+
+    std::string path = getExecutableDir() + "tint.json";
+    std::ofstream file(path, std::ios::binary);
+    if (file.is_open()) {
+        file << root.dump(2);
+        file.close();
+    }
+    else {
+        std::cerr << "Failed to create tint.json: " << path << std::endl;
     }
 }
 

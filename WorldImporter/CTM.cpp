@@ -1707,6 +1707,8 @@ void ApplyCtmToBlockModel(ModelData& model,
             for (int tilePos : SelectOverlayTiles(*overlay, L, x, y, z)) {
                 if (tilePos < 0 || tilePos >= static_cast<int>(overlay->tiles.size())) continue;
                 Face overlayFace = face;
+                // overlay 规则自带 tintIndex 时覆盖基础面的 tintindex，交给导出阶段的色型解析处理
+                if (overlay->tintIndex >= 0) overlayFace.tintIndex = static_cast<int8_t>(overlay->tintIndex);
                 CtmTexInfo oi;
                 if (overlayAtlas.valid) {
                     oi = overlayAtlas.tex;

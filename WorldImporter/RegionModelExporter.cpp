@@ -107,7 +107,7 @@ void RegionModelExporter::ExportModels(const string& outputName) {
     // 模型处理阶段
     ModelData finalMergedModel;
     std::unordered_map<string, string> uniqueMaterials;
-    std::unordered_map<string, int8_t> uniqueTints;
+    std::unordered_map<string, TintResult> uniqueTints;
 
     // 计算所有批次的总任务数
     size_t totalTasksAllBatches = 0;
@@ -165,12 +165,12 @@ void RegionModelExporter::ExportModels(const string& outputName) {
 
     // 线程安全的材质记录
     auto recordMaterials = [&](const std::unordered_map<string, string>& newMaterials,
-                                const std::unordered_map<string, int8_t>& newTints) {
+                                const std::unordered_map<string, TintResult>& newTints) {
         std::lock_guard<std::mutex> lock(materialsMutex);
         for (const auto& nm : newMaterials)
             uniqueMaterials.emplace(nm.first, nm.second);
         for (const auto& nt : newTints)
-            if (nt.second != -1) uniqueTints.emplace(nt.first, nt.second);
+            uniqueTints.emplace(nt.first, nt.second);
     };
 
     // 按批次处理区块组
@@ -258,7 +258,7 @@ void RegionModelExporter::ExportModels(const string& outputName) {
                         groupModel.faces.reserve(8192 * reserveTasks);
                         groupModel.uvCoordinates.reserve(4096 * reserveTasks);
                         std::unordered_map<string, string> localMaterials;
-                        std::unordered_map<string, int8_t> localTints;
+                        std::unordered_map<string, TintResult> localTints;
 
                         // 记录当前组内需要处理的任务数
                         size_t tasksInCurrentGroup = group.tasks.size();
@@ -329,7 +329,7 @@ void RegionModelExporter::ExportModels(const string& outputName) {
                         }
                         if (groupModel.vertices.empty()) continue;
                         for (const auto& mat : groupModel.materials)
-                            if (mat.tintIndex != -1) localTints[mat.name] = mat.tintIndex;
+                            localTints[mat.name] = mat.tint;
                         if (config.exportFullModel) {
                             mergeToFinalModel(std::move(groupModel));
                         } else {
@@ -421,6 +421,13 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         { CrafterLog::StageTimer t("写入模型文件");
         monitor.SetStatus(TaskStatus::EXPORTING_MODELS, "CreateModelFiles");
         CreateModelFiles(finalMergedModel, outputName);
+        }
+        // 全模型路径同样输出 tint.json
+        { CrafterLog::StageTimer t("写入 tint.json");
+        std::unordered_map<string, TintResult> fullModelTints;
+        for (const auto& mat : finalMergedModel.materials)
+            fullModelTints[mat.name] = mat.tint;
+        CreateTintJsonFile(fullModelTints);
         }
     }
     else if (!uniqueMaterials.empty()) {

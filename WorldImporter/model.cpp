@@ -1302,6 +1302,8 @@ void processElements(const nlohmann::json& modelJson, ModelData& data,
                     if (face.value().contains("tintindex")) {
                         localTintIndex = face.value()["tintindex"].get<int>();
                     }
+                    // 面级 tintindex(用于导出阶段的逐面色型解析)
+                    data.faces.back().tintIndex = static_cast<int8_t>(localTintIndex);
                     // 更新此材质的tintIndex
                     if (!data.materials.empty() && data.faces.back().materialIndex >= 0 && data.faces.back().materialIndex < data.materials.size()) {
                         data.materials[data.faces.back().materialIndex].tintIndex = localTintIndex;
@@ -1557,6 +1559,7 @@ ModelData MergeModelData(const ModelData& data1, const ModelData& data2) {
             
             // 保留面方向
             newFace.faceDirection = face.faceDirection;
+            newFace.tintIndex = face.tintIndex;
             
             mergedData.faces.push_back(newFace);
         }
@@ -1743,6 +1746,7 @@ ModelData MergeFluidModelData(const ModelData& data1, const ModelData& data2) {
             
             // 保留面方向
             newFace.faceDirection = face.faceDirection;
+            newFace.tintIndex = face.tintIndex;
             
             mergedData.faces.push_back(newFace);
         }
@@ -1922,6 +1926,7 @@ ModelData MergeFluidModelData(const ModelData& data1, const ModelData& data2) {
         newFace.vertexIndices = faceIndices;
         newFace.materialIndex = (data2.faces[i].materialIndex != -1) ? materialIndexMap[data2.faces[i].materialIndex] : -1;
         newFace.faceDirection = data2.faces[i].faceDirection;
+        newFace.tintIndex = data2.faces[i].tintIndex;
         mergedData.faces.push_back(newFace);
 
         // 对应的UV面处理
@@ -2033,6 +2038,7 @@ void MergeModelsDirectly(ModelData& data1, const ModelData& data2) {
         
         // 保留面方向
         newFace.faceDirection = face.faceDirection;
+        newFace.tintIndex = face.tintIndex;
         
         data1.faces.push_back(newFace);
     }

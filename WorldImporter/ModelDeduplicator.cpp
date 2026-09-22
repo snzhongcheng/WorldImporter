@@ -882,6 +882,7 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
 
         for(auto& e_final: entries){
             Face nf; nf.materialIndex=f0_group_base.materialIndex; nf.faceDirection=UNKNOWN;
+            nf.tintIndex=f0_group_base.tintIndex;
             std::array<int,4> vidx_final;
             for(int k_final=0;k_final<4;++k_final){
                 float w2d = (k_final==0||k_final==3? e_final.minW : e_final.maxW);

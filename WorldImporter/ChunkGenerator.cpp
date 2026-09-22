@@ -6,6 +6,7 @@
 #include "include/stb_image.h"
 #include "biome.h"
 #include "model.h"
+#include "blocktint.h"
 #include "Fluid.h"
 #include "LODManager.h"
 #include "CTM.h"
@@ -212,6 +213,9 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
         ApplyCtmToBlockModel(blockModel, ns, blockName, x, y, z);
         useCtm = true;
     }
+
+    // 解析 tint 并按需拆分材质（必须在 CTM 之后、面剔除之前）
+    ApplyTintToBlockModel(blockModel, currentBlock.name);
 
     // 剔除被遮挡的面
     std::vector<int> validFaceIndices;
