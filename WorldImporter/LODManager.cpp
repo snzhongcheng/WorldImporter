@@ -8,6 +8,7 @@
 #include "Fluid.h"
 #include "blocktint.h"
 #include "texture.h"
+#include "Occlusion.h"
 #include <iomanip>
 #include <sstream>
 #include <regex>
@@ -310,7 +311,8 @@ BlockType GetBlockType2(int x, int y, int z) {
     if (currentBlock.IsPureFluid()) {
         return FLUID;
     }
-    else if (!currentBlock.air) {
+    // LOD 的"实心"判定：与剔除一致，使用运行时自建遮挡表（原 solids 名单的等价物）
+    else if (GetBlockOcclusion(currentId).occludes) {
         return SOLID;
     }
     else

@@ -12,7 +12,9 @@
 #include "CTM.h"
 #include "CreateCT.h"
 #include "texture.h"
+#include "Occlusion.h"
 #include <iomanip>
+#include <cmath>
 #include <sstream>
 #include <regex>
 #include <tuple>
@@ -94,11 +96,39 @@ static bool IsFullCubeModel(const ModelData& model) {
     return true;
 }
 
-void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, int z) {
-    std::array<bool, 6> neighbors; // 邻居是否为空气
-    std::array<int, 10> fluidLevels; // 流体液位
+// --------------------------------------------------------------------------------
+// 原版流体渲染辅助（FluidRenderer）
+// --------------------------------------------------------------------------------
+namespace {
 
-    int id = GetBlockIdWithNeighbors(x, y, z, neighbors.data(), fluidLevels.data());
+// 方向索引与 FaceType 一致：UP=0, DOWN=1, NORTH=2, SOUTH=3, WEST=4, EAST=5
+enum : int {
+    FLUID_DIR_UP = 0, FLUID_DIR_DOWN = 1, FLUID_DIR_NORTH = 2,
+    FLUID_DIR_SOUTH = 3, FLUID_DIR_WEST = 4, FLUID_DIR_EAST = 5
+};
+
+inline bool IsSameFluidName(const Block& block, const std::string& fluidName) {
+    return block.HasFluid() && block.fluidName == fluidName;
+}
+
+// 原版 Vec3#normalize：长度过小视为零向量
+inline void NormalizeFlow(float& flowX, float& flowZ) {
+    const float len = std::sqrt(flowX * flowX + flowZ * flowZ);
+    if (len < 1.0e-4f) {
+        flowX = 0.0f;
+        flowZ = 0.0f;
+        return;
+    }
+    flowX /= len;
+    flowZ /= len;
+}
+
+} // namespace
+
+void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, int z) {
+    std::array<bool, 6> neighbors; // 邻居是否不遮挡（true = 该方向的面应渲染）
+
+    int id = GetBlockIdWithNeighbors(x, y, z, neighbors.data());
     Block currentBlock = GetBlockById(id);
     string blockName = currentBlock.GetModifiedNameWithNamespace();
     if (blockName == "minecraft:air") return;
@@ -150,27 +180,130 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
         for (auto& face : blockModel.faces) face.faceDirection = FaceType::DO_NOT_CULL;
     }
     else if (currentBlock.HasFluid()) {
-        blockModel = GetRandomModelFromCache(ns, blockName);
+        // ============================ 原版流体渲染路径 ============================
+        // 高度/角高/UV/贴图选择与逐面剔除完全按原版 FluidRenderer 实现。
+        const std::string& fluidName = currentBlock.fluidName;
 
-        if (blockModel.vertices.empty()) {
-            liquidModel = GenerateFluidModel(fluidLevels, currentBlock.fluidName);
-            AssignFluidMaterials(liquidModel, currentBlock.fluidName);
+        // 原版 FluidRenderer#getHeight（单位：格）：
+        //   邻居同种流体 -> 上方仍是同种流体 ? 1.0 : ownHeight(液位)
+        //   非流体       -> solidLike ? -1.0 : 0.0
+        auto renderHeight = [&](int bx, int by, int bz) -> float {
+            int nid = GetBlockId(bx, by, bz);
+            Block nb = GetBlockById(nid);
+            if (IsSameFluidName(nb, fluidName)) {
+                int upId = GetBlockId(bx, by + 1, bz);
+                Block up = GetBlockById(upId);
+                if (IsSameFluidName(up, fluidName)) return 1.0f;
+                return GetFluidOwnHeight(nb.level);
+            }
+            return GetBlockOcclusion(nid).solidLike ? -1.0f : 0.0f;
+        };
+
+        FluidModelParams params;
+        params.selfHeight = renderHeight(x, y, z);
+        params.sideHeight[0] = renderHeight(x, y, z - 1); // 北
+        params.sideHeight[1] = renderHeight(x, y, z + 1); // 南
+        params.sideHeight[2] = renderHeight(x - 1, y, z); // 西
+        params.sideHeight[3] = renderHeight(x + 1, y, z); // 东
+        params.cornerHeight[0] = renderHeight(x - 1, y, z - 1); // 西北
+        params.cornerHeight[1] = renderHeight(x + 1, y, z - 1); // 东北
+        params.cornerHeight[2] = renderHeight(x + 1, y, z + 1); // 东南
+        params.cornerHeight[3] = renderHeight(x - 1, y, z + 1); // 西南
+        params.falling = currentBlock.level >= 8;
+
+        // ---- 原版 FlowingFluid#getFlow（水平分量；falling 的 -6Y 不改变角度与"是否为零"）----
+        {
+            const float selfOwn = GetFluidOwnHeight(currentBlock.level);
+            static const int dirs[4][3] = { {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0} };
+            for (const auto& d : dirs) {
+                const int nx = x + d[0];
+                const int nz = z + d[2];
+                const int nid = GetBlockId(nx, y, nz);
+                Block nb = GetBlockById(nid);
+                const bool isAir = nb.air;
+                const bool same = IsSameFluidName(nb, fluidName);
+                if (!(isAir || same)) continue; // affectsFlow
+
+                float calc = 0.0f;
+                if (same) {
+                    const float nh = GetFluidOwnHeight(nb.level);
+                    if (nh != 0.0f) calc = selfOwn - nh;
+                }
+                else {
+                    // 邻居为空气：看其下方是否仍有同种流体（原版）
+                    const int bid = GetBlockId(nx, y - 1, nz);
+                    Block below = GetBlockById(bid);
+                    const bool belowSame = IsSameFluidName(below, fluidName);
+                    const float belowH = belowSame ? GetFluidOwnHeight(below.level) : 0.0f;
+                    if (!GetBlockOcclusion(nid).solidLike && (below.air || belowSame) && belowH > 0.0f) {
+                        calc = 8.0f / 9.0f;
+                    }
+                }
+                if (calc != 0.0f) {
+                    params.flowX += calc * static_cast<float>(d[0]);
+                    params.flowZ += calc * static_cast<float>(d[2]);
+                }
+            }
+            NormalizeFlow(params.flowX, params.flowZ);
+        }
+
+        // ---- 原版逐面渲染判定 ----
+        const int upId = GetBlockId(x, y + 1, z);
+        const int downId = GetBlockId(x, y - 1, z);
+        Block upBlock = GetBlockById(upId);
+        Block downBlock = GetBlockById(downId);
+
+        // 自身遮挡（原版 FluidRenderer#isFaceOccludedBySelf）：含水方块的水贴合方块形状，
+        // 方块自身在同一平面上的面并集完整覆盖该方向时，水的那一面不渲染。顶面按原版不做自遮挡。
+        const BlockOcclusion& selfOcc = GetBlockOcclusion(id);
+
+        // 顶面：上方同种流体不渲染（原版 renderUp 只判同种流体）
+        params.keepFace[1] = !IsSameFluidName(upBlock, fluidName);
+        // 底面：自身遮挡 / 邻居同种流体 / 邻居是完整遮挡体时不渲染
+        params.keepFace[0] = !IsSameFluidName(downBlock, fluidName) &&
+            !selfOcc.selfFaceFull[FLUID_DIR_DOWN] &&
+            !GetBlockOcclusion(downId).occludes;
+
+        // 侧面：北、南、西、东
+        static const int sideDirs[4][3] = { {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0} };
+        static const int sideDirIndices[4] = { FLUID_DIR_NORTH, FLUID_DIR_SOUTH, FLUID_DIR_WEST, FLUID_DIR_EAST };
+        for (int i = 0; i < 4; ++i) {
+            const int nx = x + sideDirs[i][0];
+            const int nz = z + sideDirs[i][2];
+            const int nid = GetBlockId(nx, y, nz);
+            Block nb = GetBlockById(nid);
+            params.keepFace[2 + i] = !IsSameFluidName(nb, fluidName) &&
+                !selfOcc.selfFaceFull[sideDirIndices[i]] &&
+                !GetBlockOcclusion(nid).occludes;
+        }
+
+        // 顶面原版优化：四个角高全满且上方是完整遮挡体时剔除
+        if (params.keepFace[1]) {
+            float corners[4]; // NW, NE, SE, SW
+            ComputeFluidCornerHeights(params, corners);
+            const float minH = std::min(std::min(corners[0], corners[1]), std::min(corners[2], corners[3]));
+            if (minH >= 1.0f && GetBlockOcclusion(upId).occludes) {
+                params.keepFace[1] = false;
+            }
+        }
+        params.downCanRender = params.keepFace[0];
+        params.topCanRender = params.keepFace[1];
+
+        liquidModel = GenerateFluidModel(params, fluidName);
+        AssignFluidMaterials(liquidModel, fluidName);
+
+        ModelData waterloggedBlockModel = GetRandomModelFromCache(ns, blockName);
+        if (waterloggedBlockModel.vertices.empty()) {
             blockModel = liquidModel;
         }
-        else
-        {
-            liquidModel = GenerateFluidModel(fluidLevels, currentBlock.fluidName);
-            AssignFluidMaterials(liquidModel, currentBlock.fluidName);
-
-            // 只对有流体方向的面设置为不剔除
-            for (auto& face : blockModel.faces)
+        else {
+            // 水方块自身带模型（含水方块等）：保留原有 DO_NOT_CULL 处理，再与流体模型合并
+            for (auto& face : waterloggedBlockModel.faces)
             {
                 FaceType dir = face.faceDirection;
                 if (dir != FaceType::DO_NOT_CULL) {
                     auto it = neighborIndexMap.find(dir);
                     if (it != neighborIndexMap.end()) {
-                        int neighborIdx = it->second;
-                        // 检查相邻方向是否有流体
                         int nx = x, ny = y, nz = z;
                         if (dir == FaceType::DOWN) ny--;
                         else if (dir == FaceType::UP) ny++;
@@ -178,10 +311,9 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
                         else if (dir == FaceType::SOUTH) nz++;
                         else if (dir == FaceType::WEST) nx--;
                         else if (dir == FaceType::EAST) nx++;
-                        
+
                         int neighborId = GetBlockId(nx, ny, nz);
                         Block neighborBlock = GetBlockById(neighborId);
-                        // 如果邻居是流体或含有流体，则不剔除
                         if (neighborBlock.HasFluid()) {
                             face.faceDirection = FaceType::DO_NOT_CULL;
                         }
@@ -189,7 +321,7 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
                 }
             }
 
-            blockModel = MergeFluidModelData(blockModel, liquidModel);
+            blockModel = MergeFluidModelData(waterloggedBlockModel, liquidModel);
         }
     }
     else
@@ -259,10 +391,10 @@ void ChunkGenerator::ProcessBlockForModel(ModelData& chunkModel, int x, int y, i
             auto it = neighborIndexMap.find(dir);
             if (it != neighborIndexMap.end()) {
                 int neighborIdx = it->second;
-                if (!neighbors[neighborIdx]) { // 如果邻居存在(非空气),跳过该面
+                if (!neighbors[neighborIdx]) { // 邻居为完整遮挡体,跳过该面
                     continue;
                 }
-                // 邻居被当作 air,但实际是 CTM 连接的同类方块,剔除内部面
+                // 邻居不遮挡,但实际是 CTM 连接的同类方块,剔除内部面
                 if (isCtmConnected(dir)) {
                     continue;
                 }

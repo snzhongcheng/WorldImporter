@@ -21,6 +21,7 @@
 #include <shared_mutex>
 #include "block.h"
 #include "TaskMonitor.h"
+#include "Occlusion.h"
 using namespace std;
 using namespace std::chrono;  // 新增:方便使用 chrono
 
@@ -193,6 +194,9 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         }
     }
 
+    // 运行时遮挡表的增量构建进度（按全局调色板下标）
+    size_t lastOcclusionBuilt = 0;
+
     for (size_t current_batch_idx = 0; current_batch_idx < ChunkGroupAllocator::g_chunkBatches.size(); ++current_batch_idx) {
         const auto& batch = ChunkGroupAllocator::g_chunkBatches[current_batch_idx];
         batchId = current_batch_idx + 1;
@@ -216,6 +220,11 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         globalPaletteFrozen.store(true, std::memory_order_release);
         blockstateCachesFrozen.store(true, std::memory_order_release);
         size_t afterLoad = CountLoadedChunks();
+
+        // 模型解析完成后、进入多线程模型阶段前，增量构建运行时遮挡表
+        // （每唯一 block state 一次几何+纹理判定，之后查询为 O(1)）
+        BuildBlockOcclusionTable(lastOcclusionBuilt);
+        lastOcclusionBuilt = globalBlockPalette.size();
         size_t newlyLoaded = (afterLoad > beforeLoad) ? (afterLoad - beforeLoad) : 0;
 
         // 处理天空光照邻居标志(在模型线程前执行,避免写冲突)

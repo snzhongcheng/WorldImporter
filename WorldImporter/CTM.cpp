@@ -663,30 +663,6 @@ static bool LoadCtmTilePngBytesWithFallback(const std::string& ns, const std::st
     return false;
 }
 
-static bool LoadTexturePixels(const std::string& ns, const std::string& texturePath,
-    std::vector<unsigned char>& outPixels, int& outW, int& outH) {
-    std::vector<unsigned char> pngData;
-    {
-        std::shared_lock<std::shared_mutex> lock(GlobalCache::cacheMutex);
-        auto indexIt = GlobalCache::textureIndex.find("textures:" + ns + ":" + texturePath);
-        if (indexIt == GlobalCache::textureIndex.end()) return false;
-        auto textureIt = GlobalCache::textures.find(indexIt->second);
-        if (textureIt == GlobalCache::textures.end()) return false;
-        pngData = textureIt->second;
-    }
-
-    int channels = 0;
-    unsigned char* pixels = stbi_load_from_memory(
-        pngData.data(), static_cast<int>(pngData.size()), &outW, &outH, &channels, 4);
-    if (!pixels || outW <= 0 || outH <= 0) {
-        if (pixels) stbi_image_free(pixels);
-        return false;
-    }
-    outPixels.assign(pixels, pixels + static_cast<size_t>(outW) * outH * 4);
-    stbi_image_free(pixels);
-    return true;
-}
-
 static bool GetMcmetaCtmTexture(const std::string& ns, const std::string& texturePath,
     std::string& outNs, std::string& outPath) {
     nlohmann::json metadata;

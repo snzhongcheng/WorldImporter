@@ -311,6 +311,52 @@ ModelData GetRandomModelFromCache(const std::string& namespaceName, const std::s
     return ModelData();
 }
 
+std::vector<ModelData> GetAllModelsFromCache(const std::string& namespaceName, const std::string& blockId) {
+    std::vector<ModelData> result;
+
+    // 加载阶段持锁，模型阶段缓存冻结后直接并发只读
+    std::shared_lock<std::shared_mutex> lock(blockstateCachesMutex, std::defer_lock);
+    if (!blockstateCachesFrozen.load(std::memory_order_acquire)) lock.lock();
+
+    auto blockNsIt = BlockModelCache.find(namespaceName);
+    if (blockNsIt != BlockModelCache.end()) {
+        auto blockIt = blockNsIt->second.find(blockId);
+        if (blockIt != blockNsIt->second.end()) {
+            result.push_back(blockIt->second);
+            return result;
+        }
+    }
+
+    auto variantNsIt = VariantModelCache.find(namespaceName);
+    if (variantNsIt != VariantModelCache.end()) {
+        auto variantIt = variantNsIt->second.find(blockId);
+        if (variantIt != variantNsIt->second.end()) {
+            for (const auto& wm : variantIt->second) {
+                result.push_back(wm.model);
+            }
+            return result;
+        }
+    }
+
+    auto multipartNsIt = MultipartModelCache.find(namespaceName);
+    if (multipartNsIt != MultipartModelCache.end()) {
+        auto multipartIt = multipartNsIt->second.find(blockId);
+        if (multipartIt != multipartNsIt->second.end()) {
+            ModelData merged;
+            for (const auto& parts : multipartIt->second) {
+                if (!parts.empty()) {
+                    merged = MergeModelData(merged, parts[0].model);
+                }
+            }
+            if (!merged.vertices.empty()) {
+                result.push_back(merged);
+            }
+        }
+    }
+
+    return result;
+}
+
 // 此方法会处理对应的json文件 
 // 然后计算出方块的模型数据存储在BlockModelCache / VariantModelCache / MultipartModelCache 里面
 // 你可以使用 GetRandomModelFromCache 方法来获取模型
