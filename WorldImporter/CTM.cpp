@@ -652,6 +652,16 @@ static bool LoadCtmTilePngBytes(const std::string& ns, const std::string& tileRe
     return false;
 }
 
+// tile 原始 PNG 字节读取(两位/一位文件名回退)；suffix 用于读取 PBR 变体
+static bool LoadCtmTilePngBytesWithFallback(const std::string& ns, const std::string& baseDir,
+    int tileIndex, std::vector<unsigned char>& outBytes, const std::string& suffix) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d", tileIndex);
+    if (LoadCtmTilePngBytes(ns, baseDir + "/" + buf + suffix, outBytes)) return true;
+    if (LoadCtmTilePngBytes(ns, baseDir + "/" + std::to_string(tileIndex) + suffix, outBytes)) return true;
+    return false;
+}
+
 static bool LoadTexturePixels(const std::string& ns, const std::string& texturePath,
     std::vector<unsigned char>& outPixels, int& outW, int& outH) {
     std::vector<unsigned char> pngData;
@@ -778,27 +788,29 @@ static CtmTexInfo GetOrCreateTileTexInfo(const std::string& ns, const std::strin
     bool needSave = GetFileAttributesW(wfull.c_str()) == INVALID_FILE_ATTRIBUTES;
     bool saved = !needSave;
     if (needSave) {
+        // 原始字节直写: 不做解码+stb 重编码
         std::vector<unsigned char> pngBytes;
-        // OptiFine 资源包 tile 命名有两种风格: 两位数字(01.png) 或 一位数字(1.png)
-        // 先试两位, 再试一位, 都找不到再跳过
-        bool loaded = false;
-        std::string tileRel2 = baseDir + "/" + std::string(tileNameBuf);  // 两位
-        if (LoadCtmTilePngBytes(ns, tileRel2, pngBytes)) {
-            loaded = true;
-        }
-        if (!loaded) {
-            std::string tileRel1 = baseDir + "/" + std::to_string(tileIndex);  // 一位
-            if (LoadCtmTilePngBytes(ns, tileRel1, pngBytes)) {
-                loaded = true;
-            }
-        }
-        if (loaded && !pngBytes.empty()) {
-            // 原始字节直写: 不做解码+stb 重编码
+        if (LoadCtmTilePngBytesWithFallback(ns, baseDir, tileIndex, pngBytes, "") && !pngBytes.empty()) {
             std::ofstream out(fullPath, std::ios::binary);
             if (out.is_open()) {
                 out.write(reinterpret_cast<const char*>(pngBytes.data()), pngBytes.size());
                 out.close();
                 saved = true;
+            }
+        }
+        // PBR 变体: 资源包提供就一并拷出, 没有就跳过
+        if (saved) {
+            const char* pbrSuffixes[3] = { "_n", "_s", "_a" };
+            for (const char* suffix : pbrSuffixes) {
+                std::vector<unsigned char> pbrBytes;
+                if (!LoadCtmTilePngBytesWithFallback(ns, baseDir, tileIndex, pbrBytes, suffix) || pbrBytes.empty())
+                    continue;
+                std::string pbrPath = BuildCtmTextureFilePath(ns, baseDir, fileName + suffix);
+                std::ofstream pbrOut(pbrPath, std::ios::binary);
+                if (pbrOut.is_open()) {
+                    pbrOut.write(reinterpret_cast<const char*>(pbrBytes.data()), pbrBytes.size());
+                    pbrOut.close();
+                }
             }
         }
     }
@@ -824,13 +836,14 @@ struct CtmAtlasInfo {
 
 static std::unordered_map<std::string, CtmAtlasInfo> g_ctmAtlasCache;
 
-// tile 像素读取(两位/一位文件名回退)
+// tile 像素读取(两位/一位文件名回退)；suffix 用于读取 PBR 变体(_n/_s/_a)
 static bool LoadCtmTilePixelsWithFallback(const std::string& ns, const std::string& baseDir,
-    int tileIndex, std::vector<unsigned char>& px, int& w, int& h) {
+    int tileIndex, std::vector<unsigned char>& px, int& w, int& h,
+    const std::string& suffix = "") {
     char buf[8];
     snprintf(buf, sizeof(buf), "%02d", tileIndex);
-    if (LoadCtmTilePixels(ns, baseDir + "/" + buf, px, w, h)) return true;
-    if (LoadCtmTilePixels(ns, baseDir + "/" + std::to_string(tileIndex), px, w, h)) return true;
+    if (LoadCtmTilePixels(ns, baseDir + "/" + buf + suffix, px, w, h)) return true;
+    if (LoadCtmTilePixels(ns, baseDir + "/" + std::to_string(tileIndex) + suffix, px, w, h)) return true;
     return false;
 }
 
@@ -906,40 +919,55 @@ static CtmAtlasInfo GetOrCreateRuleAtlas(const CtmRule& rule) {
         if (CtmTileHasAnimation(rule.ns, rule.baseDir, t)) return result;
     }
 
-    // 读取全部 tile, 要求尺寸一致
-    std::vector<std::vector<unsigned char>> pixels;
-    pixels.reserve(n);
-    int cellW = 0, cellH = 0;
-    for (int t : rule.tiles) {
-        std::vector<unsigned char> px; int w = 0, h = 0;
-        if (!LoadCtmTilePixelsWithFallback(rule.ns, rule.baseDir, t, px, w, h) || w <= 0 || h <= 0) {
-            return result;
-        }
-        if (cellW == 0) { cellW = w; cellH = h; }
-        else if (w != cellW || h != cellH) {
-            return result;  // 尺寸不一致, 回退
-        }
-        pixels.push_back(std::move(px));
-    }
-
-    const int outW = cols * cellW;
-    const int outH = rows * cellH;
-    std::vector<unsigned char> out(static_cast<size_t>(outW) * outH * 4, 0);
-    for (int i = 0; i < n; ++i) {
-        const int col = i % cols;
-        const int row = i / cols;
-        const std::vector<unsigned char>& src = pixels[i];
-        for (int yy = 0; yy < cellH; ++yy) {
-            const unsigned char* srcRow = src.data() + static_cast<size_t>(yy) * cellW * 4;
-            unsigned char* dstRow = out.data() +
-                (static_cast<size_t>(row) * cellH + yy) * outW * 4 + static_cast<size_t>(col) * cellW * 4;
-            std::memcpy(dstRow, srcRow, static_cast<size_t>(cellW) * 4);
-        }
-    }
-
     std::string fileName = "atlas_" + std::to_string(cols) + "x" + std::to_string(rows) + "_" +
         std::to_string(std::hash<std::string>{}(sig));
-    std::string fullPath = BuildCtmTextureFilePath(rule.ns, rule.baseDir, fileName);
+
+    // 合成并写出指定后缀的 atlas；任一 tile 缺失或尺寸不一致则整体跳过
+    auto buildAtlas = [&](const std::string& suffix, int& outCellW, int& outCellH) -> bool {
+        std::vector<std::vector<unsigned char>> pixels;
+        pixels.reserve(n);
+        outCellW = 0; outCellH = 0;
+        for (int t : rule.tiles) {
+            std::vector<unsigned char> px; int w = 0, h = 0;
+            if (!LoadCtmTilePixelsWithFallback(rule.ns, rule.baseDir, t, px, w, h, suffix) || w <= 0 || h <= 0) {
+                return false;
+            }
+            if (outCellW == 0) { outCellW = w; outCellH = h; }
+            else if (w != outCellW || h != outCellH) {
+                return false;  // 尺寸不一致
+            }
+            pixels.push_back(std::move(px));
+        }
+
+        const int outW = cols * outCellW;
+        const int outH = rows * outCellH;
+        std::vector<unsigned char> out(static_cast<size_t>(outW) * outH * 4, 0);
+        for (int i = 0; i < n; ++i) {
+            const int col = i % cols;
+            const int row = i / cols;
+            const std::vector<unsigned char>& src = pixels[i];
+            for (int yy = 0; yy < outCellH; ++yy) {
+                const unsigned char* srcRow = src.data() + static_cast<size_t>(yy) * outCellW * 4;
+                unsigned char* dstRow = out.data() +
+                    (static_cast<size_t>(row) * outCellH + yy) * outW * 4 + static_cast<size_t>(col) * outCellW * 4;
+                std::memcpy(dstRow, srcRow, static_cast<size_t>(outCellW) * 4);
+            }
+        }
+
+        std::string fullPath = BuildCtmTextureFilePath(rule.ns, rule.baseDir, fileName + suffix);
+        return stbi_write_png(fullPath.c_str(), outW, outH, 4, out.data(), outW * 4) != 0;
+    };
+
+    int cellW = 0, cellH = 0;
+    if (!buildAtlas("", cellW, cellH)) return result;  // albedo 失败则整体回退
+
+    // PBR 变体: 有就按同网格合成, 缺一个就整个后缀跳过
+    const char* pbrSuffixes[3] = { "_n", "_s", "_a" };
+    for (const char* suffix : pbrSuffixes) {
+        int pbrCellW = 0, pbrCellH = 0;
+        buildAtlas(suffix, pbrCellW, pbrCellH);
+    }
+
     result.tex.materialName = BuildCtmMaterialName(rule.ns, rule.baseDir, fileName);
     result.tex.texturePath = BuildCtmTextureRelPath(rule.ns, rule.baseDir, fileName);
     result.cols = cols;
@@ -954,9 +982,9 @@ static CtmAtlasInfo GetOrCreateRuleAtlas(const CtmRule& rule) {
         n == rule.width * rule.height && cols > 0 && rows > 0) {
         result.tex.periodic = true;
     }
-    result.tex.saved = stbi_write_png(fullPath.c_str(), outW, outH, 4, out.data(), outW * 4) != 0;
-    if (result.tex.saved) {
-        result.valid = true;
+    result.tex.saved = true;
+    result.valid = true;
+    {
         std::lock_guard<std::mutex> lk2(g_ctmTexCacheMutex);
         g_ctmAtlasCache[id] = result;
     }
@@ -1099,53 +1127,61 @@ static CtmTexInfo GetOrCreateCompactTexInfo(const std::string& ns, const std::st
     bool needSave = GetFileAttributesW(wfull.c_str()) == INVALID_FILE_ATTRIBUTES;
     bool saved = !needSave;
 
-    if (needSave) {
-        // 读取 4 张需要的 tile 像素
-        // 缓存到局部 map 避免重复加载
+    // 按后缀读取 4 个象限 tile 并合成为一张图；缺源/尺寸不符返回 false
+    auto buildCompact = [&](const std::string& suffix) -> bool {
         std::unordered_map<int, std::pair<std::vector<unsigned char>, std::pair<int, int>>> tilePx;
-        bool ok = true;
         for (int i = 0; i < 4; ++i) {
             int tn = tileSel[i];
             if (tilePx.count(tn)) continue;
-            std::string tileRel = baseDir + "/" + std::to_string(tn);
+            std::string tileRel = baseDir + "/" + std::to_string(tn) + suffix;
             std::vector<unsigned char> px; int w = 0, h = 0;
             if (!LoadCtmTilePixels(ns, tileRel, px, w, h) || w != h) {
-                ok = false;
-                break;
+                return false;
             }
             tilePx[tn] = { px, {w, h} };
         }
-        if (ok) {
-            // 取 tile 尺寸(假设所有 tile 同尺寸且为正方形)
-            int tw = tilePx[tileSel[0]].second.first;
-            int half = tw / 2;
-            int outW = tw, outH = tw; // 合成图与 tile 同尺寸
-            std::vector<unsigned char> out((size_t)outW * outH * 4, 0);
 
-            // 4 象限在合成图和 tile 中的位置(象限索引: 0=TL 1=BL 2=BR 3=TR)
-            // [0]=TL: x[0,half),   y[0,half)
-            // [1]=BL: x[0,half),   y[half,tw)
-            // [2]=BR: x[half,tw),  y[half,tw)
-            // [3]=TR: x[half,tw),  y[0,half)
-            int qx0[4] = { 0, 0, half, half };
-            int qy0[4] = { 0, half, half, 0 };
+        // 取 tile 尺寸(假设所有 tile 同尺寸且为正方形)
+        int tw = tilePx[tileSel[0]].second.first;
+        int half = tw / 2;
+        int outW = tw, outH = tw; // 合成图与 tile 同尺寸
+        std::vector<unsigned char> out((size_t)outW * outH * 4, 0);
 
-            for (int i = 0; i < 4; ++i) {
-                auto& tp = tilePx[tileSel[i]];
-                const std::vector<unsigned char>& px = tp.first;
-                int w = tp.second.first;
-                for (int yy = 0; yy < half; ++yy) {
-                    for (int xx = 0; xx < half; ++xx) {
-                        int srcIdx = ((qy0[i] + yy) * w + (qx0[i] + xx)) * 4;
-                        int dstIdx = ((qy0[i] + yy) * outW + (qx0[i] + xx)) * 4;
-                        out[dstIdx + 0] = px[srcIdx + 0];
-                        out[dstIdx + 1] = px[srcIdx + 1];
-                        out[dstIdx + 2] = px[srcIdx + 2];
-                        out[dstIdx + 3] = px[srcIdx + 3];
-                    }
+        // 4 象限在合成图和 tile 中的位置(象限索引: 0=TL 1=BL 2=BR 3=TR)
+        // [0]=TL: x[0,half),   y[0,half)
+        // [1]=BL: x[0,half),   y[half,tw)
+        // [2]=BR: x[half,tw),  y[half,tw)
+        // [3]=TR: x[half,tw),  y[0,half)
+        int qx0[4] = { 0, 0, half, half };
+        int qy0[4] = { 0, half, half, 0 };
+
+        for (int i = 0; i < 4; ++i) {
+            auto& tp = tilePx[tileSel[i]];
+            const std::vector<unsigned char>& px = tp.first;
+            int w = tp.second.first;
+            for (int yy = 0; yy < half; ++yy) {
+                for (int xx = 0; xx < half; ++xx) {
+                    int srcIdx = ((qy0[i] + yy) * w + (qx0[i] + xx)) * 4;
+                    int dstIdx = ((qy0[i] + yy) * outW + (qx0[i] + xx)) * 4;
+                    out[dstIdx + 0] = px[srcIdx + 0];
+                    out[dstIdx + 1] = px[srcIdx + 1];
+                    out[dstIdx + 2] = px[srcIdx + 2];
+                    out[dstIdx + 3] = px[srcIdx + 3];
                 }
             }
-            saved = stbi_write_png(fullPath.c_str(), outW, outH, 4, out.data(), outW * 4) != 0;
+        }
+        std::string path = BuildCtmTextureFilePath(ns, baseDir, fileName + suffix);
+        return stbi_write_png(path.c_str(), outW, outH, 4, out.data(), outW * 4) != 0;
+    };
+
+    if (needSave) {
+        saved = buildCompact("");
+        // PBR 变体: 有就合成, 缺一个就整个后缀跳过
+        if (saved) {
+            const char* pbrSuffixes[3] = { "_n", "_s", "_a" };
+            for (const char* suffix : pbrSuffixes) {
+                buildCompact(suffix);
+            }
         }
     }
 
@@ -1218,41 +1254,57 @@ static CtmTexInfo GetOrCreateMcmetaCtmTexInfo(const std::string& ns,
         return info;
     }
 
-    int half = baseW / 2;
-    std::vector<unsigned char> output(static_cast<size_t>(baseW) * baseH * 4);
-    const int destinationX[4] = { 0, half, half, 0 };
-    const int destinationY[4] = { half, half, 0, 0 };
-    for (int quadrant = 0; quadrant < 4; ++quadrant) {
-        int submap = submaps[quadrant];
-        const std::vector<unsigned char>* source = nullptr;
-        int sourceWidth = 0, sourceX = 0, sourceY = 0;
-        if (submap >= 16) {
-            source = &basePixels;
-            sourceWidth = baseW;
-            int baseQuadrant = submap - 16;
-            sourceX = (baseQuadrant % 2) * half;
-            sourceY = (baseQuadrant / 2) * half;
-        }
-        else {
-            source = &ctmPixels;
-            sourceWidth = ctmW;
-            sourceX = (submap % 4) * half;
-            sourceY = (submap / 4) * half;
-        }
+    // 按同样的 submap 规则合成一张图；suffix 控制 PBR 变体
+    auto composeAndWrite = [&](const std::vector<unsigned char>& baseSrc, int bw, int bh,
+                               const std::vector<unsigned char>& ctmSrc, int cw,
+                               const std::string& suffix) -> bool {
+        int half = bw / 2;
+        std::vector<unsigned char> output(static_cast<size_t>(bw) * bh * 4);
+        const int destinationX[4] = { 0, half, half, 0 };
+        const int destinationY[4] = { half, half, 0, 0 };
+        for (int quadrant = 0; quadrant < 4; ++quadrant) {
+            int submap = submaps[quadrant];
+            const std::vector<unsigned char>* source = nullptr;
+            int sourceWidth = 0, sourceX = 0, sourceY = 0;
+            if (submap >= 16) {
+                source = &baseSrc;
+                sourceWidth = bw;
+                int baseQuadrant = submap - 16;
+                sourceX = (baseQuadrant % 2) * half;
+                sourceY = (baseQuadrant / 2) * half;
+            }
+            else {
+                source = &ctmSrc;
+                sourceWidth = cw;
+                sourceX = (submap % 4) * half;
+                sourceY = (submap / 4) * half;
+            }
 
-        for (int yy = 0; yy < half; ++yy) {
-            for (int xx = 0; xx < half; ++xx) {
-                size_t src = (static_cast<size_t>(sourceY + yy) * sourceWidth + sourceX + xx) * 4;
-                size_t dst = (static_cast<size_t>(destinationY[quadrant] + yy) * baseW +
-                    destinationX[quadrant] + xx) * 4;
-                std::copy_n(source->data() + src, 4, output.data() + dst);
+            for (int yy = 0; yy < half; ++yy) {
+                for (int xx = 0; xx < half; ++xx) {
+                    size_t src = (static_cast<size_t>(sourceY + yy) * sourceWidth + sourceX + xx) * 4;
+                    size_t dst = (static_cast<size_t>(destinationY[quadrant] + yy) * bw +
+                        destinationX[quadrant] + xx) * 4;
+                    std::copy_n(source->data() + src, 4, output.data() + dst);
+                }
             }
         }
-    }
+        std::string fullPath = BuildCtmTextureFilePath(ns, baseDir, signature + suffix);
+        return stbi_write_png(fullPath.c_str(), bw, bh, 4, output.data(), bw * 4) != 0;
+    };
 
-    std::string fullPath = BuildCtmTextureFilePath(ns, baseDir, signature);
-    info.saved = stbi_write_png(fullPath.c_str(), baseW, baseH, 4, output.data(), baseW * 4) != 0;
+    info.saved = composeAndWrite(basePixels, baseW, baseH, ctmPixels, ctmW, "");
     if (info.saved) {
+        // PBR 变体: 基础纹理与 CTM 图的同后缀都要在, 尺寸关系一致才合成
+        const char* pbrSuffixes[3] = { "_n", "_s", "_a" };
+        for (const char* suffix : pbrSuffixes) {
+            std::vector<unsigned char> basePbr, ctmPbr;
+            int bw = 0, bh = 0, cw = 0, ch = 0;
+            if (!LoadTexturePixels(ns, texturePath + suffix, basePbr, bw, bh)) continue;
+            if (!LoadTexturePixels(ctmNs, ctmPath + suffix, ctmPbr, cw, ch)) continue;
+            if (bw != bh || cw != ch || cw != bw * 2) continue;
+            composeAndWrite(basePbr, bw, bh, ctmPbr, cw, suffix);
+        }
         std::lock_guard<std::mutex> lock(g_ctmTexCacheMutex);
         g_ctmTexCache[cacheId] = info;
     }
