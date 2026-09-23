@@ -39,7 +39,8 @@ static std::mutex g_ctmRuleMutex;       // 保护规则索引读取(初始化后
 // 已合成/保存过的 CTM 贴图模板缓存,避免重复 IO
 // key = "ns|baseDir|identifier" -> {materialName, texturePath, saved}
 struct CtmTexInfo {
-    std::string materialName;   // 例如 minecraft:ctm/optifine/ctm/glass/glass/m123
+    std::string materialName;   // CTM 身份名,例如 minecraft:ctm/optifine/ctm/glass/glass/m123
+    std::string shortId;        // 材质名后缀,例如 ctm/00_a1b2(不含 @)
     std::string texturePath;    // 相对路径,例如 textures/minecraft/ctm/.../m123.png
     bool saved = false;
     // 周期 atlas(repeat): 面 UV 按世界坐标周期排列, 贪心合并可跨格扩展
@@ -759,6 +760,22 @@ static std::string BuildCtmMaterialName(const std::string& ns,
     return name;
 }
 
+// FNV-1a 32bit: 生成稳定短 hash(跨构建一致), 用于 CTM 材质名去重
+static uint32_t Fnv1a32(const std::string& text) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char c : text) {
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static std::string ShortHash4(const std::string& text) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%04x", Fnv1a32(text) & 0xFFFFu);
+    return buf;
+}
+
 // 获取或创建一个 CTM 材质信息(模板)。仅保存"整张 tile"类型(horizontal/vertical/ctm/compact-fallback)。
 // tileIndex: tile 编号
 static CtmTexInfo GetOrCreateTileTexInfo(const std::string& ns, const std::string& baseDir, int tileIndex) {
@@ -774,6 +791,7 @@ static CtmTexInfo GetOrCreateTileTexInfo(const std::string& ns, const std::strin
     // OptiFine tile 文件名约定为两位数字: 01.png ~ 16.png (与 properties 中 tiles=01 02 ... 对应)
     std::string fileName = std::string(tileNameBuf);
     info.materialName = BuildCtmMaterialName(ns, baseDir, fileName);
+    info.shortId = "ctm/" + fileName + "_" + ShortHash4(baseDir);
     info.texturePath = BuildCtmTextureRelPath(ns, baseDir, fileName);
 
     // 保存 PNG(只保存一次)
@@ -969,6 +987,7 @@ static CtmAtlasInfo GetOrCreateRuleAtlas(const CtmRule& rule) {
     }
 
     result.tex.materialName = BuildCtmMaterialName(rule.ns, rule.baseDir, fileName);
+    result.tex.shortId = "ctm/" + fileName + "_" + ShortHash4(rule.baseDir);
     result.tex.texturePath = BuildCtmTextureRelPath(rule.ns, rule.baseDir, fileName);
     result.cols = cols;
     result.rows = rows;
@@ -1113,6 +1132,7 @@ static CtmTexInfo GetOrCreateCompactTexInfo(const std::string& ns, const std::st
 
     CtmTexInfo info;
     info.materialName = BuildCtmMaterialName(ns, baseDir, fileName);
+    info.shortId = "ctm/" + fileName + "_" + ShortHash4(baseDir);
     info.texturePath = BuildCtmTextureRelPath(ns, baseDir, fileName);
 
     std::lock_guard<std::mutex> lkPng(g_ctmPngMutex);
@@ -1237,6 +1257,7 @@ static CtmTexInfo GetOrCreateMcmetaCtmTexInfo(const std::string& ns,
 
     CtmTexInfo info;
     info.materialName = BuildCtmMaterialName(ns, baseDir, signature);
+    info.shortId = "ctm_mcmeta/" + signature;
     info.texturePath = BuildCtmTextureRelPath(ns, baseDir, signature);
 
     std::lock_guard<std::mutex> pngLock(g_ctmPngMutex);
@@ -1583,11 +1604,13 @@ void ApplyCtmToBlockModel(ModelData& model,
     // model 内的 CTM 材质名 -> materialIndex
     std::unordered_map<std::string, int> localCtmMatIndex;
     std::vector<PendingOverlayFace> pendingOverlays;
-    auto getOrAddMaterial = [&](const CtmTexInfo& info) -> int {
-        auto it = localCtmMatIndex.find(info.materialName);
+    // 按 (原材质, CTM 身份) 建材质: 名字形如 "minecraft:block/glass@ctm/00_a1b2"
+    auto getOrAddMaterial = [&](const std::string& baseName, const CtmTexInfo& info) -> int {
+        const std::string key = baseName + "|" + info.materialName;
+        auto it = localCtmMatIndex.find(key);
         if (it != localCtmMatIndex.end()) return it->second;
         Material m;
-        m.name = info.materialName;
+        m.name = baseName + "@" + info.shortId;
         m.texturePath = info.texturePath;
         m.tintIndex = -1;
         m.type = NORMAL;
@@ -1598,13 +1621,20 @@ void ApplyCtmToBlockModel(ModelData& model,
         m.uvCellH = info.cellH;
         int idx = (int)model.materials.size();
         model.materials.push_back(m);
-        localCtmMatIndex[info.materialName] = idx;
+        localCtmMatIndex[key] = idx;
         return idx;
         };
 
     for (auto& face : model.faces) {
         if (face.materialIndex < 0 || face.materialIndex >= (int)model.materials.size()) continue;
         const Material& mat = model.materials[face.materialIndex];
+
+        // 原材质名(去掉 tint/链式 CTM 的 @ 后缀), 用作新材质的 base 前缀
+        std::string baseMaterialName = mat.name;
+        {
+            size_t at = baseMaterialName.find('@');
+            if (at != std::string::npos) baseMaterialName = baseMaterialName.substr(0, at);
+        }
 
         // 从材质名/路径提取贴图名
         // mat.name 形如 "minecraft:block/glass", mat.texturePath 形如 "textures/minecraft/block/glass.png"
@@ -1735,7 +1765,7 @@ void ApplyCtmToBlockModel(ModelData& model,
         }
 
         if (got) {
-            face.materialIndex = getOrAddMaterial(info);
+            face.materialIndex = getOrAddMaterial(baseMaterialName, info);
             // overlay 的 matchTiles 可能指向前一条 CTM 规则产生的 tile。
             // 生成材质名形如 ns:ctm/optifine/.../t7，将其还原为 optifine/.../7 再查一次。
             std::string resolved = chainMaterialName.empty() ? info.materialName : chainMaterialName;
@@ -1771,7 +1801,7 @@ void ApplyCtmToBlockModel(ModelData& model,
                 else {
                     oi = GetOrCreateTileTexInfo(overlay->ns, overlay->baseDir, overlay->tiles[tilePos]);
                 }
-                if (oi.saved) pendingOverlays.push_back({overlayFace, ft, getOrAddMaterial(oi)});
+                if (oi.saved) pendingOverlays.push_back({overlayFace, ft, getOrAddMaterial(baseMaterialName, oi)});
             }
         }
 

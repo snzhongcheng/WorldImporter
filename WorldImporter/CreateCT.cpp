@@ -443,7 +443,8 @@ bool ApplyCreateCTToBlockModel(ModelData& model, const std::string& ns,
         if (connectedRel.empty()) continue;
 
         // 材质: 每个"原材质名"对应一个 connected 材质 (tint 沿用原材质)
-        std::string ctMatKey = matNs + ":" + texturePath + "_connected";
+        // 名字形如 "create:block/brass_casing@create_ct", 插件按 @ 前的 base 分类
+        std::string ctMatKey = matNs + ":" + texturePath + "@create_ct";
         int ctMatIdx;
         auto it = ctMatIndex.find(ctMatKey);
         if (it != ctMatIndex.end()) {

@@ -147,7 +147,7 @@ ModelData GenerateFluidModel(const std::array<int, 10>& fluidLevels, const std::
     float southwestHeight = getHeight(southwestLevel);
 
     // 计算四个上顶点的高度
-    // �����ĸ��϶���ĸ߶�
+    // �����ĸ��϶���ĸ߶�
     // If the block above is solid(-2), raise water surface to full height
     // so it touches the bottom of the solid block, avoiding an air gap.
     float h_nw, h_ne, h_se, h_sw;
@@ -416,7 +416,7 @@ ModelData GenerateFluidModel(const std::array<int, 10>& fluidLevels, const std::
     // 添加材质
     // 静止流体材质(still)- 用于顶部和底部
     Material stillMaterial;
-    stillMaterial.name = base_id + "_still";
+    stillMaterial.name = namespace_name + ":" + base_id + "_still";
     stillMaterial.texturePath = "textures/" + namespace_name + "/" + stillTexturePath + ".png";
     stillMaterial.tintIndex = (base_id.find("water") != string::npos) ? 2 : -1; // 只对水使用色调索引2
     stillMaterial.type = stillType;
@@ -424,7 +424,7 @@ ModelData GenerateFluidModel(const std::array<int, 10>& fluidLevels, const std::
 
     // 流动流体材质(flow)- 用于侧面
     Material flowMaterial;
-    flowMaterial.name = base_id + "_flow"; 
+    flowMaterial.name = namespace_name + ":" + base_id + "_flow"; 
     flowMaterial.texturePath = "textures/" + namespace_name + "/" + flowTexturePath + ".png";
     flowMaterial.tintIndex = (base_id.find("water") != string::npos) ? 2 : -1; // 只对水使用色调索引2
     flowMaterial.type = flowType;
@@ -512,6 +512,7 @@ void AssignFluidMaterials(ModelData& model, const std::string& fluidId) {
     size_t colonPosDef = fluidName.find(':');
     std::string ns = (colonPosDef != std::string::npos) ? fluidName.substr(0, colonPosDef) : "";
     std::string pureName = (colonPosDef != std::string::npos) ? fluidName.substr(colonPosDef + 1) : fluidName;
+    std::string nsPrefix = ns.empty() ? std::string() : (ns + ":");
     
     // 获取材质长宽比
     float stillAspectRatio = 1.0f;
@@ -519,7 +520,7 @@ void AssignFluidMaterials(ModelData& model, const std::string& fluidId) {
     
     // 创建静止流体材质
     Material stillFluid;
-    stillFluid.name = fluidInfo.folder + "/" + pureName + fluidInfo.still_texture;
+    stillFluid.name = nsPrefix + fluidInfo.folder + "/" + pureName + fluidInfo.still_texture;
     stillFluid.texturePath = "textures/" + ns + "/" + fluidInfo.folder + "/" + pureName + fluidInfo.still_texture + ".png";
     stillFluid.tintIndex = (pureName.find("water") != std::string::npos) ? 2 : -1;
     stillFluid.type = DetectMaterialType(ns, fluidInfo.folder + "/" + pureName + fluidInfo.still_texture, stillAspectRatio);
@@ -527,7 +528,7 @@ void AssignFluidMaterials(ModelData& model, const std::string& fluidId) {
     
     // 创建流动流体材质
     Material flowFluid;
-    flowFluid.name = fluidInfo.folder + "/" + pureName + fluidInfo.flow_texture;
+    flowFluid.name = nsPrefix + fluidInfo.folder + "/" + pureName + fluidInfo.flow_texture;
     flowFluid.texturePath = "textures/" + ns + "/" + fluidInfo.folder + "/" + pureName + fluidInfo.flow_texture + ".png";
     flowFluid.tintIndex = (pureName.find("water") != std::string::npos) ? 2 : -1;
     flowFluid.type = DetectMaterialType(ns, fluidInfo.folder + "/" + pureName + fluidInfo.flow_texture, flowAspectRatio);
