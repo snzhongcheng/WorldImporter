@@ -34,6 +34,28 @@ inline VertexKey MakeVertexKey(float x, float y, float z) {
         static_cast<int>(std::round(z * 10000.0f))
     };
 }
+
+/* 并发预算与去重线程数 */
+namespace {
+    std::atomic<int> g_modelThreadBudget{1};
+}
+
+void SetModelThreadBudget(int threads) {
+    g_modelThreadBudget.store(threads > 1 ? threads : 1, std::memory_order_relaxed);
+}
+
+// 去重内部的并行度:外层多线程时按预算分摊核数,避免线程数量爆炸。
+static unsigned int DedupThreadCount() {
+    unsigned int hc = std::thread::hardware_concurrency();
+    if (hc == 0) hc = 1;
+    int budget = g_modelThreadBudget.load(std::memory_order_relaxed);
+    // 外层已有多个长期存活的模型线程时，内部去重保持串行。
+    // 旧逻辑按 hc/budget 继续反复创建短命线程，4×4 线程频繁退出会在
+    // MinGW/UCRT TLS 清理路径触发 0xC0000374，且线程创建开销抵消收益。
+    if (budget > 1) return 1;
+    return hc;
+}
+
 // 2x2矩阵结构体,用于UV坐标变换
 struct Matrix2x2 {
     float m[2][2];
@@ -105,7 +127,7 @@ void ModelDeduplicator::DeduplicateVertices(ModelData& data) {
     std::vector<KeyAndIndex> keys(vertCount);
 
     // 并行计算顶点键
-    unsigned int numThreads = std::thread::hardware_concurrency();
+    unsigned int numThreads = DedupThreadCount();
     if (numThreads == 0) numThreads = 1;
     std::vector<std::thread> threads;
     threads.reserve(numThreads);
@@ -329,7 +351,7 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
     // 1. 计算所有面的法线 (并行化)
     std::vector<Vector3> faceNormals(faceCount);
     {
-        unsigned int numThreads = std::thread::hardware_concurrency();
+        unsigned int numThreads = DedupThreadCount();
         if (numThreads == 0) numThreads = 1;
         std::vector<std::thread> threads;
         threads.reserve(numThreads);
@@ -369,7 +391,7 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
     // 使用批次填充以减少同步成本
     const size_t BATCH_SIZE = 1024; // 每批次处理的面数
     std::vector<std::vector<std::pair<EdgeKey,int>>> threadBatches;
-    unsigned int numThreads2 = std::thread::hardware_concurrency(); if (numThreads2 == 0) numThreads2 = 1;
+    unsigned int numThreads2 = DedupThreadCount(); if (numThreads2 == 0) numThreads2 = 1;
     threadBatches.resize(numThreads2);
     
     std::vector<std::thread> fillThreads; fillThreads.reserve(numThreads2);
@@ -454,7 +476,7 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
     int vertCount = data.vertices.size() / 3;
     std::vector<std::pair<VertexKey,int>> vertKVPairs(vertCount);
     {
-        unsigned int numThreads = std::thread::hardware_concurrency();
+        unsigned int numThreads = DedupThreadCount();
         if (numThreads == 0) numThreads = 1;
         std::vector<std::thread> threads;
         threads.reserve(numThreads);
@@ -908,9 +930,8 @@ void ModelDeduplicator::GreedyMesh(ModelData& data) {
                 Vector3 pos_final{P0_group_base.x + w2d*T1_group_base.x + h2d*T2_group_base.x,
                                   P0_group_base.y + w2d*T1_group_base.y + h2d*T2_group_base.y,
                                   P0_group_base.z + w2d*T1_group_base.z + h2d*T2_group_base.z};
-                int rx_final=int(pos_final.x*10000+0.5f), ry_final=int(pos_final.y*10000+0.5f), rz_final=int(pos_final.z*10000+0.5f);
                 {
-                    VertexKey vk{rx_final, ry_final, rz_final};
+                    VertexKey vk = MakeVertexKey(pos_final.x, pos_final.y, pos_final.z);
                     int mappedIdx = lookupVertexIndex(vk);
                     vidx_final[k_final] = mappedIdx;
                     nf.vertexIndices[k_final] = mappedIdx;

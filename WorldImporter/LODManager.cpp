@@ -289,36 +289,59 @@ float LODManager::GetChunkLODAtBlock(int x, int y, int z) {
     return 1.0f; // 默认使用高精度, 或者可以考虑返回一个表示未找到的特殊值
 }
 
-BlockType GetBlockType(int x, int y, int z) {
-    int currentId = GetBlockId(x, y, z);
-    Block currentBlock = GetBlockById(currentId);
+namespace {
+    // Block ID → 分类的线程本地缓存。
+    // 全局方块调色板 ID 一旦注册就不会改变语义,因此缓存无需失效。
+    // LOD 判定对每个方块调用多次 GetBlockType,旧实现每次都构造 Block
+    // 对象(字符串解析+流体表扫描),是 LOD 阶段的主要 CPU 开销之一。
+    BlockType ClassifyForGetBlockType(int id) {
+        thread_local std::unordered_map<int, BlockType> cache;
+        auto it = cache.find(id);
+        if (it != cache.end()) return it->second;
+        Block currentBlock = GetBlockById(id);
+        BlockType type;
+        if (currentBlock.name == "minecraft:air") {
+            type = AIR;
+        }
+        else if (currentBlock.IsPureFluid()) {
+            type = FLUID;
+        }
+        else {
+            type = SOLID;
+        }
+        cache.emplace(id, type);
+        return type;
+    }
 
-    if (currentBlock.name == "minecraft:air") {
-        return AIR;
-    }
-    else if (currentBlock.IsPureFluid()) {
-        return FLUID;
-    }
-    else {
-        return SOLID;
+    BlockType ClassifyForGetBlockType2(int id) {
+        thread_local std::unordered_map<int, BlockType> cache;
+        auto it = cache.find(id);
+        if (it != cache.end()) return it->second;
+        Block currentBlock = GetBlockById(id);
+        BlockType type;
+        if (currentBlock.IsPureFluid()) {
+            type = FLUID;
+        }
+        // LOD 的"实心"判定：与剔除一致，使用运行时自建遮挡表（原 solids 名单的等价物）
+        // 注意：不能使用 currentBlock.air（只覆盖 air/cave_air/void_air），
+        // 否则高草、十字模型等非遮挡方块会被误判为 SOLID。
+        else if (GetBlockOcclusion(id).occludes) {
+            type = SOLID;
+        }
+        else {
+            type = AIR;
+        }
+        cache.emplace(id, type);
+        return type;
     }
 }
 
-BlockType GetBlockType2(int x, int y, int z) {
-    int currentId = GetBlockId(x, y, z);
-    Block currentBlock = GetBlockById(currentId);
+BlockType GetBlockType(int x, int y, int z) {
+    return ClassifyForGetBlockType(GetBlockId(x, y, z));
+}
 
-    if (currentBlock.IsPureFluid()) {
-        return FLUID;
-    }
-    // LOD 的"实心"判定：与剔除一致，使用运行时自建遮挡表（原 solids 名单的等价物）
-    else if (GetBlockOcclusion(currentId).occludes) {
-        return SOLID;
-    }
-    else
-    {
-        return AIR;
-    }
+BlockType GetBlockType2(int x, int y, int z) {
+    return ClassifyForGetBlockType2(GetBlockId(x, y, z));
 }
 
 // 确定 LOD 块类型的函数
