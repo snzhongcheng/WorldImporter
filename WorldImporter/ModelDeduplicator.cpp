@@ -283,16 +283,26 @@ void ModelDeduplicator::DeduplicateFaces(ModelData& data) {
     keys.reserve(faceCountNum);
 
     // 第一次遍历:计算每个面的规范化键并存入数组(避免重复排序)
+    // 键 = (顶点索引, UV 索引) 配对排序 + 材质。UV 必须参与: 同一方块面上
+    // 的 CTM overlay 会有多个面(顶点/材质相同, 仅 tile/UV 不同), 只按顶点
+    // 去重会误删第二个 tile(表现为连接纹理缺角、缺边)。
     for (size_t i = 0; i < data.faces.size(); i++) {
         const auto& face = data.faces[i];
-        std::array<int, 4> faceArray = {
-            face.vertexIndices[0], face.vertexIndices[1],
-            face.vertexIndices[2], face.vertexIndices[3]
-        };
-        std::array<int, 4> sorted = faceArray;
-        std::sort(sorted.begin(), sorted.end());
+        std::array<std::pair<int, int>, 4> pairs = {{
+            { face.vertexIndices[0], face.uvIndices[0] },
+            { face.vertexIndices[1], face.uvIndices[1] },
+            { face.vertexIndices[2], face.uvIndices[2] },
+            { face.vertexIndices[3], face.uvIndices[3] }
+        }};
+        std::sort(pairs.begin(), pairs.end());
+        std::array<int, 4> sortedVerts;
+        std::array<int, 4> sortedUVs;
+        for (int k = 0; k < 4; ++k) {
+            sortedVerts[k] = pairs[k].first;
+            sortedUVs[k] = pairs[k].second;
+        }
         int matIndex = config.strictDeduplication ? face.materialIndex : -1;
-        keys.push_back(FaceKey{ sorted, matIndex });
+        keys.push_back(FaceKey{ sortedVerts, sortedUVs, matIndex });
     }
 
     // 第二次遍历:每个重合面键保留首个面。

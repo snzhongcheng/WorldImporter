@@ -38,6 +38,7 @@ struct Material {
     std::string texturePath;// 纹理路径
     int8_t  tintIndex;      // tint 索引
     TintResult tint;        // 解析后的 tint 结果（None 表示不上色）
+    bool tintLocked = false;// tint 已由 CTM 规则(tintIndex/tintBlock)锁定, 不再参与重解析
     MaterialType type;      // 材质类型
     float aspectRatio;      // 动态材质长宽比（高/宽）
     // 周期 atlas 材质(仅 repeat CTM): 面 UV 落在 atlas 格子里, 且格子按世界
@@ -97,8 +98,11 @@ struct UVKey {
 };
 
 // 自定义顶点键
+// 注意: 必须包含 UV 索引。CTM overlay 会在同一方块面上叠加多个 tile
+// (顶点/材质相同, 仅 UV 不同), 只按顶点+材质去重会把它们误删(缺角/缺边)。
 struct FaceKey {
     std::array<int, 4> sortedVerts;
+    std::array<int, 4> sortedUVs;   // 与 sortedVerts 一一对应
     int materialIndex;
     
     // C++20: 使用<=>运算符简化比较操作
@@ -129,6 +133,9 @@ struct FaceKeyHasher {
         // 使用C++20的ranges功能来简化遍历
         for (int v : k.sortedVerts) {
             seed ^= std::hash<int>()(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
+        for (int u : k.sortedUVs) {
+            seed ^= std::hash<int>()(u) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
         }
         return seed;
     }

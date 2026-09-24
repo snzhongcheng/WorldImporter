@@ -3,6 +3,8 @@
 #include "block.h"          // GetBlockId / GetBlockById / Block
 #include "blockstate.h"     // GetRandomModelFromCache (connect=tile)
 #include "model.h"          // ModelData / Face / Material / FaceType
+#include "blocktint.h"      // TintResult / ResolveTint / TintSuffix
+#include "Occlusion.h"      // GetBlockOcclusion (overlay 隐藏边判定)
 #include "texture.h"        // MaterialType
 #include "fileutils.h"      // string_to_wstring / wstring_to_string
 #include "include/stb_image.h"
@@ -273,7 +275,24 @@ void InitializeCtmRules() {
         }
         if (kv.count("connectTiles")) rule.connectTiles = SplitComma(kv["connectTiles"]);
         if (kv.count("layer")) rule.layer = kv["layer"];
-        if (kv.count("tintIndex")) { try { rule.tintIndex = std::stoi(kv["tintIndex"]); } catch (...) {} }
+        if (kv.count("tintIndex")) {
+            // 数字 -> tintIndex; 命名值(grass/foliage/... 或包作者写的 stone/podzol 等)
+            // 存进 tintIndexName, 由 applyRuleTint 决定取色型还是不染色
+            rule.hasTint = true;
+            const std::string& tintValue = kv["tintIndex"];
+            try {
+                rule.tintIndex = std::stoi(tintValue);
+            } catch (...) {
+                rule.tintIndex = -1;
+                rule.tintIndexName = tintValue;
+            }
+        }
+        if (kv.count("tintBlock")) {
+            rule.hasTint = true;
+            std::string tintBlock = kv["tintBlock"];
+            if (tintBlock.find(':') == std::string::npos) tintBlock = "minecraft:" + tintBlock;
+            rule.tintBlock = std::move(tintBlock);
+        }
         if (kv.count("resourceCondition")) rule.resourceCondition = kv["resourceCondition"];
         for (const auto& p : kv) {
             if (p.first.rfind("ctm.", 0) != 0) continue;
@@ -502,9 +521,10 @@ static FaceType InferDirectionFromFace(const ModelData& model, const Face& face)
 }
 
 // 一个面在其"贴图空间"的上/下/左/右 边方向 与 4 个角方向的世界偏移。
-// 注意: 方向必须匹配 WorldImporter 的 OBJ UV 映射约定(而非 Continuity 的约定)。
-// 经实测, WorldImporter 侧面贴图的 left/right 与 Continuity 相反,
-// 这里采用匹配 WorldImporter UV 的方向(之前"大部分没问题"的版本)。
+// 表与 Continuity 的 DirectionMaps.map[face][0] 完全一致
+// (UP: l=W d=S r=E u=N; DOWN: l=E d=N r=W u=S; 侧面: 贴图左右即站在该面外看的方向)。
+// overlay 面按此表选 tile, 并配合 AssignCanonicalFaceUv 的规范 UV 生成, 与游戏一致;
+// 非 overlay 方法沿用基础面自身 UV 帧(游戏 orientation 默认 NONE, 连接位用固定表)。
 struct FaceLayout {
     std::array<int,3> up, down, left, right;
     std::array<int,3> upLeft, upRight, downLeft, downRight;
@@ -518,7 +538,7 @@ static FaceLayout GetFaceLayout(FaceType ft) {
         L.up = { 0,0,-1 }; L.down = { 0,0,1 }; L.left = { -1,0,0 }; L.right = { 1,0,0 };
         break;
     case FaceType::DOWN:
-        L.up = { 0,0,-1 }; L.down = { 0,0,1 }; L.left = { 1,0,0 }; L.right = { -1,0,0 };
+        L.up = { 0,0,1 }; L.down = { 0,0,-1 }; L.left = { 1,0,0 }; L.right = { -1,0,0 };
         break;
     case FaceType::NORTH:
         L.up = { 0,1,0 }; L.down = { 0,-1,0 }; L.left = { 1,0,0 }; L.right = { -1,0,0 };
@@ -576,32 +596,6 @@ static int GetTextureOrientation(const ModelData& model, const Face& face, FaceT
     float y = -(pm01 * itm10 + pm11 * itm11) * ySign;
     int rotation = std::abs(y) >= std::abs(x) ? (y > 0.0f ? 0 : 2) : (x > 0.0f ? 3 : 1);
     return rotation + (determinant < 0.0f ? 4 : 0);
-}
-
-static FaceLayout GetFaceLayout(const ModelData& model, const Face& face, FaceType ft) {
-    static constexpr int directionMaps[8][4] = {
-        {0,1,2,3}, {1,2,3,0}, {2,3,0,1}, {3,0,1,2},
-        {2,1,0,3}, {3,2,1,0}, {0,3,2,1}, {1,0,3,2}
-    };
-    static constexpr int quadrantMaps[8][4] = {
-        {0,1,2,3}, {3,0,1,2}, {2,3,0,1}, {1,2,3,0},
-        {3,2,1,0}, {0,3,2,1}, {1,0,3,2}, {2,1,0,3}
-    };
-    FaceLayout base = GetFaceLayout(ft);
-    const std::array<int,3>* dirs[4] = { &base.left, &base.down, &base.right, &base.up };
-    int orientation = GetTextureOrientation(model, face, ft);
-    FaceLayout L{};
-    L.left = *dirs[directionMaps[orientation][0]];
-    L.down = *dirs[directionMaps[orientation][1]];
-    L.right = *dirs[directionMaps[orientation][2]];
-    L.up = *dirs[directionMaps[orientation][3]];
-    L.quadrantMap = { quadrantMaps[orientation][0], quadrantMaps[orientation][1],
-                      quadrantMaps[orientation][2], quadrantMaps[orientation][3] };
-    L.upLeft = { L.up[0] + L.left[0], L.up[1] + L.left[1], L.up[2] + L.left[2] };
-    L.upRight = { L.up[0] + L.right[0], L.up[1] + L.right[1], L.up[2] + L.right[2] };
-    L.downLeft = { L.down[0] + L.left[0], L.down[1] + L.left[1], L.down[2] + L.left[2] };
-    L.downRight = { L.down[0] + L.right[0], L.down[1] + L.right[1], L.down[2] + L.right[2] };
-    return L;
 }
 
 // ========= PNG 读写 =========
@@ -1010,6 +1004,39 @@ static void RemapFaceUvToAtlas(ModelData& model, Face& face, int col, int row, i
         int newIdx = static_cast<int>(model.uvCoordinates.size()) / 2;
         model.uvCoordinates.push_back(nu);
         model.uvCoordinates.push_back(nv);
+        face.uvIndices[i] = newIdx;
+    }
+}
+
+// Overlay 面在游戏里由 Continuity 独立生成(QuadUtil.emitOverlayQuad 用
+// emitter.square(face,0,0,1,1,0) + assignLerpedUVs), UV 永远按该面方向的
+// "规范朝向"(原版贴图约定)排布, 与基础面自身的随机/镜像 UV(例如资源包给
+// grass_block/dirt_path 配的 4 个 y 轴随机旋转变体、stone_mirrored 变体)无关。
+// 因此 overlay 面必须按顶点位置重算规范 UV 再映射进 atlas 格子, 否则草沿会
+// 跟着基础面一起旋转/镜像, 与游戏里的位置不符。
+// 顶点此时是方块局部坐标(0..1, ApplyPositionOffset 在 CTM 之后才执行)。
+static void AssignCanonicalFaceUv(ModelData& model, Face& face, FaceType ft) {
+    for (int i = 0; i < 4; ++i) {
+        int vi = face.vertexIndices[i];
+        if (vi < 0) continue;
+        size_t o = static_cast<size_t>(vi) * 3;
+        if (o + 2 >= model.vertices.size()) continue;
+        float dx = model.vertices[o];
+        float dy = model.vertices[o + 1];
+        float dz = model.vertices[o + 2];
+        float u = 0.0f, v = 0.0f;
+        switch (ft) {
+        case FaceType::UP:    u = dx;        v = 1.0f - dz; break; // +u=E, +v=N
+        case FaceType::DOWN:  u = 1.0f - dx; v = dz;        break; // +u=W, +v=S
+        case FaceType::NORTH: u = 1.0f - dx; v = dy;        break; // +u=W, +v=UP
+        case FaceType::SOUTH: u = dx;        v = dy;        break; // +u=E, +v=UP
+        case FaceType::WEST:  u = dz;        v = dy;        break; // +u=S, +v=UP
+        case FaceType::EAST:  u = 1.0f - dz; v = dy;        break; // +u=N, +v=UP
+        default: return;
+        }
+        int newIdx = static_cast<int>(model.uvCoordinates.size()) / 2;
+        model.uvCoordinates.push_back(u);
+        model.uvCoordinates.push_back(v);
         face.uvIndices[i] = newIdx;
     }
 }
@@ -1514,6 +1541,72 @@ static bool BlockMatchesAny(const std::string& fullName, const std::vector<std::
     return false;
 }
 
+// 面法线偏移(用于 Continuity 的"斜前方遮挡"判定: pos + dir + 面法线)
+static std::array<int, 3> FaceNormalOffset(FaceType ft) {
+    switch (ft) {
+    case FaceType::UP: return { 0, 1, 0 };
+    case FaceType::DOWN: return { 0, -1, 0 };
+    case FaceType::NORTH: return { 0, 0, -1 };
+    case FaceType::SOUTH: return { 0, 0, 1 };
+    case FaceType::WEST: return { -1, 0, 0 };
+    case FaceType::EAST: return { 1, 0, 0 };
+    default: return { 0, 0, 0 };
+    }
+}
+
+// 邻居方块是否也是本 overlay 规则的目标(Continuity: hasSameOverlay)。
+// 判定: 邻居名命中 rule.matchBlocks(容忍状态后缀写法), 或邻居模型材质命中 rule.matchTiles;
+// 两者都存在时必须同时命中。Continuity 此判定不查遮挡, 这里保持一致。
+static bool OverlaySideIsSameOverlay(const CtmRule& rule, int x, int y, int z,
+    const std::array<int, 3>& off) {
+    int id = GetBlockId(x + off[0], y + off[1], z + off[2]);
+    if (id < 0) return false;
+    Block nb = GetBlockById(id);
+    const std::string nbBase = nb.GetNameAndNameSpaceWithoutState();
+    size_t nbColon = nbBase.find(':');
+    const std::string nbNs = nbColon == std::string::npos ? "minecraft" : nbBase.substr(0, nbColon);
+    const std::string nbName = nbColon == std::string::npos ? nbBase : nbBase.substr(nbColon + 1);
+
+    bool blocksOk = rule.matchBlocks.empty();
+    for (const auto& pattern : rule.matchBlocks) {
+        std::string p = pattern;
+        size_t bracket = p.find('[');
+        if (bracket != std::string::npos) p.resize(bracket);
+        // "ns:block:prop=value" -> "ns:block"
+        size_t first = p.find(':');
+        if (first != std::string::npos) {
+            size_t second = p.find(':', first + 1);
+            if (second != std::string::npos) p.resize(second);
+        }
+        size_t colon = p.find(':');
+        const std::string pns = colon == std::string::npos ? "minecraft" : p.substr(0, colon);
+        const std::string pname = colon == std::string::npos ? p : p.substr(colon + 1);
+        if (pns != nbNs) continue;
+        if (MatchBlockName(pname, nbName)) { blocksOk = true; break; }
+    }
+    if (!blocksOk) return false;
+
+    bool tilesOk = rule.matchTiles.empty();
+    if (!rule.matchTiles.empty()) {
+        std::string full = nb.name;
+        size_t c = full.find(':');
+        ModelData m = GetRandomModelFromCache(nb.GetNamespace(), c == std::string::npos ? full : full.substr(c + 1));
+        for (const auto& mat : m.materials) {
+            std::string mns = nb.GetNamespace(), path = mat.name;
+            size_t mc = path.find(':');
+            if (mc != std::string::npos) { mns = path.substr(0, mc); path = path.substr(mc + 1); }
+            if (path.rfind("textures/", 0) == 0) path = path.substr(9);
+            if (path.size() > 4 && path.substr(path.size() - 4) == ".png") path.resize(path.size() - 4);
+            for (size_t i = 0; i < rule.matchTiles.size(); ++i) {
+                const std::string& tns = i < rule.matchTileNamespaces.size() ? rule.matchTileNamespaces[i] : std::string("minecraft");
+                if (mns == tns && path == rule.matchTiles[i]) { tilesOk = true; break; }
+            }
+            if (tilesOk) break;
+        }
+    }
+    return tilesOk;
+}
+
 static bool OverlayNeighborMatches(const CtmRule& rule, int x, int y, int z, const std::array<int,3>& off) {
     int id = GetBlockId(x+off[0], y+off[1], z+off[2]);
     if (id < 0) return false;
@@ -1539,25 +1632,94 @@ static bool OverlayNeighborMatches(const CtmRule& rule, int x, int y, int z, con
     return false;
 }
 
-static std::vector<int> SelectOverlayTiles(const CtmRule& rule, const FaceLayout& L, int x, int y, int z) {
-    bool l=OverlayNeighborMatches(rule,x,y,z,L.left), d=OverlayNeighborMatches(rule,x,y,z,L.down);
-    bool r=OverlayNeighborMatches(rule,x,y,z,L.right), u=OverlayNeighborMatches(rule,x,y,z,L.up);
-    bool ld=OverlayNeighborMatches(rule,x,y,z,L.downLeft), dr=OverlayNeighborMatches(rule,x,y,z,L.downRight);
-    bool ru=OverlayNeighborMatches(rule,x,y,z,L.upRight), ul=OverlayNeighborMatches(rule,x,y,z,L.upLeft);
-    int mask=(l?1:0)|(d?2:0)|(r?4:0)|(u?8:0);
+// 标准 overlay(17 tile)的 tile 选择, 对齐 Continuity 的 StandardOverlayQuadProcessor:
+//   1) 每条边的连接 = 邻居命中 connectBlocks/connectTiles, 且该边"斜前方"
+//      (pos + dir + 面法线)不是完整不透明方块(被墙挡住的边不发 overlay);
+//   2) 边 tile 表与 Continuity 的 applications 表一致(9=左 7=右 15=上 1=下 ...);
+//   3) 内角 tile: 该角两条相邻边都未连接 + 斜对角连接 + 角两侧至少一侧也是本规则
+//      目标(hasSameOverlay) 时补一个角 tile: 左下 2 / 右下 0 / 右上 14 / 左上 16。
+//   (旧实现把内角画在"连接侧"的角上, 与游戏镜像相反, 且相邻两边连接时漏画对角。)
+static std::vector<int> SelectOverlayTiles(const CtmRule& rule, const FaceLayout& L,
+    FaceType face, int x, int y, int z) {
+    const std::array<int, 3> faceNormal = FaceNormalOffset(face);
+    // Continuity 的 appliesOverlay(overlay 方法 + connect=block):
+    //   邻居必须是满方块(用"不透明满立方"近似 isFullCube; 本包规则的连接方块
+    //   grass_block/gravel/rooted_dirt 都是不透明满立方)、命中 connectBlocks/
+    //   connectTiles, 且与宿主不是同类方块。
+    //   侧面连接没有"斜前方遮挡"判定; 只有内角的斜对角才有 isOpaqueFullCube 检查。
+    const std::string selfBase = GetBlockById(GetBlockId(x, y, z)).GetNameAndNameSpaceWithoutState();
+    auto appliesOverlay = [&](const std::array<int, 3>& dir) -> bool {
+        int id = GetBlockId(x + dir[0], y + dir[1], z + dir[2]);
+        if (id < 0) return false;
+        if (!GetBlockOcclusion(id).occludes) return false;
+        if (GetBlockById(id).GetNameAndNameSpaceWithoutState() == selfBase) return false;
+        return OverlayNeighborMatches(rule, x, y, z, dir);
+    };
+    const bool l = appliesOverlay(L.left), d = appliesOverlay(L.down);
+    const bool r = appliesOverlay(L.right), u = appliesOverlay(L.up);
+    const int mask = (l ? 1 : 0) | (d ? 2 : 0) | (r ? 4 : 0) | (u ? 8 : 0);
+
     std::vector<int> out;
-    switch(mask) {
-    case 15: out={8}; break; case 7: out={5}; break; case 11: out={6}; break;
-    case 13: out={13}; break; case 14: out={12}; break;
-    case 5: out={9,7}; break; case 10: out={1,15}; break;
-    case 3: out={4}; break; case 6: out={3}; break; case 12: out={10}; break; case 9: out={11}; break;
-    case 1: out={9}; if(ld)out.push_back(2); if(ul)out.push_back(16); break;
-    case 2: out={1}; if(ld)out.push_back(2); if(dr)out.push_back(0); break;
-    case 4: out={7}; if(dr)out.push_back(0); if(ru)out.push_back(14); break;
-    case 8: out={15}; if(ru)out.push_back(14); if(ul)out.push_back(16); break;
-    case 0: if(ld)out.push_back(2); if(dr)out.push_back(0); if(ru)out.push_back(14); if(ul)out.push_back(16); break;
+    switch (mask) {
+    case 15: out = {8}; break;
+    case 7: out = {5}; break;
+    case 11: out = {6}; break;
+    case 13: out = {13}; break;
+    case 14: out = {12}; break;
+    case 5: out = {9, 7}; break;
+    case 10: out = {1, 15}; break;
+    case 3: out = {4}; break;
+    case 6: out = {3}; break;
+    case 12: out = {10}; break;
+    case 9: out = {11}; break;
+    case 1: out = {9}; break;
+    case 2: out = {1}; break;
+    case 4: out = {7}; break;
+    case 8: out = {15}; break;
+    default: break; // mask == 0: 只可能出内角
+    }
+
+    struct OverlayCorner {
+        const std::array<int, 3>* sideA;
+        const std::array<int, 3>* sideB;
+        bool connectedA;
+        bool connectedB;
+        const std::array<int, 3>* diagonal;
+        int tile;
+    };
+    const OverlayCorner corners[4] = {
+        { &L.left,  &L.down,  l, d, &L.downLeft,  2 },  // 左下角
+        { &L.down,  &L.right, d, r, &L.downRight, 0 },  // 右下角
+        { &L.right, &L.up,    r, u, &L.upRight,  14 },  // 右上角
+        { &L.up,    &L.left,  u, l, &L.upLeft,   16 },  // 左上角
+    };
+    for (const OverlayCorner& c : corners) {
+        if (c.connectedA || c.connectedB) continue;              // 两条相邻边都必须未连接
+        if (!appliesOverlay(*c.diagonal)) continue;              // 斜对角要连接(同上 appliesOverlay)
+        // 对角的"斜前方"(pos + 对角 + 面法线)为不透明满方块时该内角被挡住, 不画
+        // (Continuity: appliesOverlayCorner 末尾的 isOpaqueFullCube 判定)
+        const std::array<int, 3>& dia = *c.diagonal;
+        int hidden = GetBlockId(x + dia[0] + faceNormal[0],
+                                y + dia[1] + faceNormal[1],
+                                z + dia[2] + faceNormal[2]);
+        if (hidden >= 0 && GetBlockOcclusion(hidden).occludes) continue;
+        if (!OverlaySideIsSameOverlay(rule, x, y, z, *c.sideA) &&
+            !OverlaySideIsSameOverlay(rule, x, y, z, *c.sideB)) continue; // 角两侧至少一侧同类
+        out.push_back(c.tile);
     }
     return out;
+}
+
+// tintIndex 命名值 -> 色型。未知名字(如 stone/podzol/sand)返回 None, 按不染色处理。
+static TintKind TintKindFromName(const std::string& name) {
+    if (name == "grass") return TintKind::Grass;
+    if (name == "foliage") return TintKind::Foliage;
+    if (name == "dry_foliage" || name == "dryfoliage") return TintKind::DryFoliage;
+    if (name == "water") return TintKind::Water;
+    if (name == "water_fog" || name == "waterfog") return TintKind::WaterFog;
+    if (name == "fog") return TintKind::Fog;
+    if (name == "sky") return TintKind::Sky;
+    return TintKind::None;
 }
 
 struct PendingOverlayFace { Face face; FaceType direction; int materialIndex; };
@@ -1602,6 +1764,35 @@ void ApplyCtmToBlockModel(ModelData& model,
         localCtmMatIndex[key] = idx;
         return idx;
         };
+
+    // 规则显式声明了 tintIndex/tintBlock 时, 在这里把 tint 直接解析并锁定到材质:
+    //   - 命名 tint(grass/foliage/...) 直接取对应色型
+    //   - 数字 tintIndex 用 tintBlock(缺省当前方块)解析
+    //   - 其他无效名字(如 stone/podzol)或不染色 -> 锁定为"不上色"
+    // 面不再参与 tintindex 解析, 既让草径的草沿按 tintBlock=grass_block 取到草色,
+    // 也避免草方块上的砂砾 overlay 继承基础面 tintindex 被染成草绿。
+    const std::string currentFullName = ns + ":" + blockName;
+    auto applyRuleTint = [&](int materialIndex, const CtmRule& rule) {
+        if (!rule.hasTint) return;
+        if (materialIndex < 0 || materialIndex >= (int)model.materials.size()) return;
+        Material& material = model.materials[materialIndex];
+        if (material.tintLocked) return; // 每个材质只解析一次
+        TintResult tint;
+        if (!rule.tintIndexName.empty()) {
+            TintKind kind = TintKindFromName(rule.tintIndexName);
+            if (kind != TintKind::None) tint.kind = kind;
+        } else if (rule.tintIndex >= 0) {
+            const std::string& tintSource = rule.tintBlock.empty() ? currentFullName : rule.tintBlock;
+            tint = ResolveTint(tintSource, rule.tintIndex);
+        }
+        material.tint = tint;
+        material.tintLocked = true;
+        if (tint.on()) {
+            material.name += TintSuffix(tint);
+        } else {
+            material.tintIndex = -1;
+        }
+    };
 
     for (auto& face : model.faces) {
         if (face.materialIndex < 0 || face.materialIndex >= (int)model.materials.size()) continue;
@@ -1744,6 +1935,13 @@ void ApplyCtmToBlockModel(ModelData& model,
 
         if (got) {
             face.materialIndex = getOrAddMaterial(baseMaterialName, info);
+            if (rule && rule->hasTint &&
+                rule->method != CtmMethod::Overlay && rule->method != CtmMethod::OverlayHorizontal) {
+                // 规则自带 tint: 由材质承接, 面不再按当前方块解析
+                // (overlay 规则的 tint 只作用于叠加层, 不覆盖基础面)
+                applyRuleTint(face.materialIndex, *rule);
+                face.tintIndex = -1;
+            }
             // overlay 的 matchTiles 可能指向前一条 CTM 规则产生的 tile。
             // 生成材质名形如 ns:ctm/optifine/.../t7，将其还原为 optifine/.../7 再查一次。
             std::string resolved = chainMaterialName.empty() ? info.materialName : chainMaterialName;
@@ -1764,11 +1962,15 @@ void ApplyCtmToBlockModel(ModelData& model,
         for (const CtmRule* overlay : overlayRules) {
             if (!CtmRuleMatchesFace(*overlay, ftn)) continue;
             const CtmAtlasInfo& overlayAtlas = GetRuleAtlasCached(overlay);
-            for (int tilePos : SelectOverlayTiles(*overlay, L, x, y, z)) {
+            for (int tilePos : SelectOverlayTiles(*overlay, L, ft, x, y, z)) {
                 if (tilePos < 0 || tilePos >= static_cast<int>(overlay->tiles.size())) continue;
                 Face overlayFace = face;
-                // overlay 规则自带 tintIndex 时覆盖基础面的 tintindex，交给导出阶段的色型解析处理
-                if (overlay->tintIndex >= 0) overlayFace.tintIndex = static_cast<int8_t>(overlay->tintIndex);
+                // 规则显式声明 tint(tintIndex/tintBlock) 时由 applyRuleTint 锁定到材质,
+                // 面不再继承基础面的 tintindex
+                if (overlay->hasTint) overlayFace.tintIndex = -1;
+                // 游戏里 overlay quad 由 Continuity 独立按面方向的规范朝生成,
+                // 不继承基础面的随机旋转/镜像 UV
+                AssignCanonicalFaceUv(model, overlayFace, ft);
                 CtmTexInfo oi;
                 if (overlayAtlas.valid) {
                     oi = overlayAtlas.tex;
@@ -1779,7 +1981,11 @@ void ApplyCtmToBlockModel(ModelData& model,
                 else {
                     oi = GetOrCreateTileTexInfo(overlay->ns, overlay->baseDir, overlay->tiles[tilePos]);
                 }
-                if (oi.saved) pendingOverlays.push_back({overlayFace, ft, getOrAddMaterial(baseMaterialName, oi)});
+                if (oi.saved) {
+                    int overlayMatIndex = getOrAddMaterial(baseMaterialName, oi);
+                    applyRuleTint(overlayMatIndex, *overlay);
+                    pendingOverlays.push_back({overlayFace, ft, overlayMatIndex});
+                }
             }
         }
 

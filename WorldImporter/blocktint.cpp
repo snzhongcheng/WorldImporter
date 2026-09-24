@@ -235,6 +235,18 @@ void ApplyTintToBlockModel(ModelData& model, const std::string& blockStateName) 
     newMaterials.reserve(model.materials.size());
 
     auto variantIndex = [&](int original, const TintResult& tint) -> int {
+        // CTM 规则已把 tint 解析并锁定到材质(见 CTM.cpp applyRuleTint)时原样保留,
+        // 不能再按当前方块的 tintindex 重解析(否则草方块上的砂砾 overlay 会被染成草绿)。
+        if (model.materials[original].tintLocked) {
+            for (const auto& v : variants) {
+                if (v.original == original) return v.newIndex;
+            }
+            Material material = model.materials[original];
+            int index = static_cast<int>(newMaterials.size());
+            newMaterials.push_back(std::move(material));
+            variants.push_back({original, TintResult{}, index});
+            return index;
+        }
         for (const auto& v : variants) {
             if (v.original == original && v.tint == tint) return v.newIndex;
         }
