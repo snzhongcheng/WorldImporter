@@ -1722,7 +1722,85 @@ static TintKind TintKindFromName(const std::string& name) {
     return TintKind::None;
 }
 
-struct PendingOverlayFace { Face face; FaceType direction; int materialIndex; };
+struct PendingOverlayFace { Face face; FaceType direction; int materialIndex; float offset; };
+
+// 面法线: 优先由顶点叉积计算(与绕序一致), 顶点不足/退化时退回面方向。
+static bool GetFaceNormal(const ModelData& model, const Face& face, float n[3]) {
+    float p[3][3];
+    int found = 0;
+    for (int i = 0; i < 4 && found < 3; ++i) {
+        int vi = face.vertexIndices[i];
+        if (vi < 0) continue;
+        size_t o = static_cast<size_t>(vi) * 3;
+        if (o + 2 >= model.vertices.size()) continue;
+        p[found][0] = model.vertices[o];
+        p[found][1] = model.vertices[o + 1];
+        p[found][2] = model.vertices[o + 2];
+        ++found;
+    }
+    if (found == 3) {
+        float e1[3] = { p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2] };
+        float e2[3] = { p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2] };
+        n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (len > 1e-6f) {
+            n[0] /= len; n[1] /= len; n[2] /= len;
+            return true;
+        }
+    }
+    const std::array<int, 3> fn = FaceNormalOffset(face.faceDirection);
+    if (fn[0] != 0 || fn[1] != 0 || fn[2] != 0) {
+        n[0] = static_cast<float>(fn[0]);
+        n[1] = static_cast<float>(fn[1]);
+        n[2] = static_cast<float>(fn[2]);
+        return true;
+    }
+    return false;
+}
+
+// 取面上第一个有效顶点沿法线的平面距离
+static bool GetFacePlane(const ModelData& model, const Face& face, const float n[3], float& plane) {
+    for (int i = 0; i < 4; ++i) {
+        int vi = face.vertexIndices[i];
+        if (vi < 0) continue;
+        size_t o = static_cast<size_t>(vi) * 3;
+        if (o + 2 >= model.vertices.size()) continue;
+        plane = n[0] * model.vertices[o] + n[1] * model.vertices[o + 1] + n[2] * model.vertices[o + 2];
+        return true;
+    }
+    return false;
+}
+
+// 计算 CTM overlay 的基准偏移: 扫描同法线、同平面(窗口内)的已有面, 取最高的
+// 平面偏移。模型解析阶段(model.cpp)已把原版 overlay 层沿法线外移, 这里保证
+// CTM overlay 落在这些层之上; 返回值 0 表示该平面上没有更高的层。
+static float ComputeOverlayBaseOffset(const ModelData& model, const Face& srcFace,
+    int srcFaceIndex, float step) {
+    float n[3];
+    if (!GetFaceNormal(model, srcFace, n)) return 0.0f;
+    float srcPlane = 0.0f;
+    if (!GetFacePlane(model, srcFace, n, srcPlane)) return 0.0f;
+
+    // 窗口要能覆盖多个叠加层(步长可配置), 同时不把远处无关平面算进来
+    const float window = std::max(0.02f, step * 8.0f);
+    float maxPlane = srcPlane;
+    for (int fi = 0; fi < static_cast<int>(model.faces.size()); ++fi) {
+        if (fi == srcFaceIndex) continue;
+        const Face& f = model.faces[fi];
+        float fn[3];
+        if (!GetFaceNormal(model, f, fn)) continue;
+        const float align = fn[0] * n[0] + fn[1] * n[1] + fn[2] * n[2];
+        if (std::fabs(align) < 0.999f) continue; // 只统计同朝向的面
+        float fp = 0.0f;
+        if (!GetFacePlane(model, f, n, fp)) continue;
+        if (fp <= srcPlane + 1e-5f) continue;    // 只看源面之上的层
+        if (fp - srcPlane > window) continue;
+        if (fp > maxPlane) maxPlane = fp;
+    }
+    return maxPlane - srcPlane;
+}
 
 // ========= ApplyCtmToBlockModel =========
 void ApplyCtmToBlockModel(ModelData& model,
@@ -1958,7 +2036,13 @@ void ApplyCtmToBlockModel(ModelData& model,
                     overlayRules.push_back(candidate);
         }
 
-        // Overlay 保留基础面，再追加一层带透明 PNG 的轻微外移面。
+        // Overlay 保留基础面，再追加一层带透明 PNG 的外移面。
+        // 层间顺序(与 Continuity 的绘制顺序一致): 基础面 < 原版 overlay 元素
+        // (model.cpp 已逐层外移) < CTM overlay; 同一面的多个 tile 也要依次错开,
+        // 否则 Blender/Eevee 中共面会 z-fighting 闪烁。
+        int overlayTileIndex = 0;
+        float overlayBaseOffset = 0.0f;
+        bool overlayBaseComputed = false;
         for (const CtmRule* overlay : overlayRules) {
             if (!CtmRuleMatchesFace(*overlay, ftn)) continue;
             const CtmAtlasInfo& overlayAtlas = GetRuleAtlasCached(overlay);
@@ -1982,9 +2066,17 @@ void ApplyCtmToBlockModel(ModelData& model,
                     oi = GetOrCreateTileTexInfo(overlay->ns, overlay->baseDir, overlay->tiles[tilePos]);
                 }
                 if (oi.saved) {
+                    if (!overlayBaseComputed) {
+                        overlayBaseOffset = ComputeOverlayBaseOffset(model, face,
+                            static_cast<int>(&face - model.faces.data()), config.overlayLayerStep);
+                        overlayBaseComputed = true;
+                    }
                     int overlayMatIndex = getOrAddMaterial(baseMaterialName, oi);
                     applyRuleTint(overlayMatIndex, *overlay);
-                    pendingOverlays.push_back({overlayFace, ft, overlayMatIndex});
+                    float overlayOffset = overlayBaseOffset +
+                        config.overlayLayerStep * static_cast<float>(overlayTileIndex + 1);
+                    pendingOverlays.push_back({overlayFace, ft, overlayMatIndex, overlayOffset});
+                    ++overlayTileIndex;
                 }
             }
         }
@@ -1999,22 +2091,22 @@ void ApplyCtmToBlockModel(ModelData& model,
     }
 
     // 统一追加，避免遍历 model.faces 时 vector 扩容使引用失效。
-    constexpr float eps = 0.0005f;
     for (auto& p : pendingOverlays) {
         float nx=0,ny=0,nz=0;
         switch(p.direction) {
-        case FaceType::DOWN:ny=-eps;break; case FaceType::UP:ny=eps;break;
-        case FaceType::NORTH:nz=-eps;break; case FaceType::SOUTH:nz=eps;break;
-        case FaceType::WEST:nx=-eps;break; case FaceType::EAST:nx=eps;break;
+        case FaceType::DOWN:ny=-1.0f;break; case FaceType::UP:ny=1.0f;break;
+        case FaceType::NORTH:nz=-1.0f;break; case FaceType::SOUTH:nz=1.0f;break;
+        case FaceType::WEST:nx=-1.0f;break; case FaceType::EAST:nx=1.0f;break;
         default:break;
         }
+        const float off = p.offset;
         for (int i=0;i<4;++i) {
             int old=p.face.vertexIndices[i]; if(old<0)continue;
             size_t vi=static_cast<size_t>(old)*3; if(vi+2>=model.vertices.size())continue;
             int ni=static_cast<int>(model.vertices.size()/3);
-            model.vertices.push_back(model.vertices[vi]+nx);
-            model.vertices.push_back(model.vertices[vi+1]+ny);
-            model.vertices.push_back(model.vertices[vi+2]+nz);
+            model.vertices.push_back(model.vertices[vi]+nx*off);
+            model.vertices.push_back(model.vertices[vi+1]+ny*off);
+            model.vertices.push_back(model.vertices[vi+2]+nz*off);
             p.face.vertexIndices[i]=ni;
         }
         p.face.materialIndex=p.materialIndex;

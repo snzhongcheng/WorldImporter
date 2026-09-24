@@ -1110,8 +1110,11 @@ void processElements(const nlohmann::json& modelJson, ModelData& data,
                             !seenMaterials.contains(currentMaterialIndex);
 
                         if (config.allowDoubleFace || isLayeredMaterial) {
+                            // 共面叠加层(如草方块侧面的 overlay 元素)逐层沿法线外移,
+                            // 步长与 CTM overlay 共用 config.overlayLayerStep,
+                            // 保证 Blender/Eevee 下各层不再共面。
                             int count = ++faceCountMap[key];
-                            float offset = (count - 1) * 0.001f;
+                            float offset = (count - 1) * config.overlayLayerStep;
                             for (auto& v : faceVertices) {
                                 v[0] += crossX * offset;
                                 v[1] += crossY * offset;

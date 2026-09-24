@@ -44,6 +44,7 @@ struct Config {
     bool exportLightBlockOnly;//仅导出光源方块
     float lightBlockSize; //光源方块半径大小
     bool allowDoubleFace;//允许重叠面
+    float overlayLayerStep; //共面叠加层(原版 overlay / CTM overlay)的逐层外移步长, 避免 Blender 下 z-fighting
     bool activeLOD; //使用LOD
     bool isLODAutoCenter; //是否自动计算LOD中心坐标
     int LODCenterX; //LOD中心坐标X
@@ -89,6 +90,7 @@ struct Config {
         exportLightBlockOnly(false),
         lightBlockSize(0.05f),
         allowDoubleFace(false),
+        overlayLayerStep(0.003f),
         isLODAutoCenter(true),
         LODCenterX(0),
         LODCenterZ(0),
