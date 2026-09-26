@@ -77,8 +77,15 @@ std::vector<char> GetChunkNBTData(const std::vector<char>& fileData, int x, int 
     int localZ = mod32(z);
     unsigned offset = CalculateChunkOffset(fileData, localX, localZ);
     
-    if (offset == 0) {
+    if (offset < 8192) {
         cerr << "错误: 偏移计算失败." << endl;
+        return {};
+    }
+
+    const unsigned sectorCount = static_cast<unsigned char>(
+        fileData[4 * (localX + localZ * 32) + 3]);
+    if (sectorCount == 0) {
+        cerr << "错误: 无效的扇区分配表项." << endl;
         return {};
     }
 
