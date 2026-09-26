@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(zlib REQUIRED)
+find_package(ZLIB REQUIRED)
 find_package(libzip CONFIG REQUIRED)
 
 file(GLOB SOURCE_FILES "WorldImporter/*.cpp")
