@@ -21,6 +21,7 @@
 #include <shared_mutex>
 #include "block.h"
 #include "TaskMonitor.h"
+#include "Occlusion.h"
 using namespace std;
 using namespace std::chrono;  // 新增:方便使用 chrono
 
@@ -100,14 +101,13 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         return chunkSet.size();
     };
 
-    // 用于跟踪已处理的区块,避免重复生成生物群系数据
+    // 用于跟踪已处理的区块,避免重复生成生物群系数据(仅在批次加载阶段串行使用)
     std::unordered_set<std::pair<int, int>, pair_hash> processedBiomeChunks;
-    std::mutex biomeMutex;
 
     // 模型处理阶段
     ModelData finalMergedModel;
     std::unordered_map<string, string> uniqueMaterials;
-    std::unordered_map<string, int8_t> uniqueTints;
+    std::unordered_map<string, TintResult> uniqueTints;
 
     // 计算所有批次的总任务数
     size_t totalTasksAllBatches = 0;
@@ -165,12 +165,12 @@ void RegionModelExporter::ExportModels(const string& outputName) {
 
     // 线程安全的材质记录
     auto recordMaterials = [&](const std::unordered_map<string, string>& newMaterials,
-                                const std::unordered_map<string, int8_t>& newTints) {
+                                const std::unordered_map<string, TintResult>& newTints) {
         std::lock_guard<std::mutex> lock(materialsMutex);
         for (const auto& nm : newMaterials)
             uniqueMaterials.emplace(nm.first, nm.second);
         for (const auto& nt : newTints)
-            if (nt.second != -1) uniqueTints.emplace(nt.first, nt.second);
+            uniqueTints.emplace(nt.first, nt.second);
     };
 
     // 按批次处理区块组
@@ -192,6 +192,9 @@ void RegionModelExporter::ExportModels(const string& outputName) {
             }
         }
     }
+
+    // 运行时遮挡表的增量构建进度（按全局调色板下标）
+    size_t lastOcclusionBuilt = 0;
 
     for (size_t current_batch_idx = 0; current_batch_idx < ChunkGroupAllocator::g_chunkBatches.size(); ++current_batch_idx) {
         const auto& batch = ChunkGroupAllocator::g_chunkBatches[current_batch_idx];
@@ -216,6 +219,11 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         globalPaletteFrozen.store(true, std::memory_order_release);
         blockstateCachesFrozen.store(true, std::memory_order_release);
         size_t afterLoad = CountLoadedChunks();
+
+        // 模型解析完成后、进入多线程模型阶段前，增量构建运行时遮挡表
+        // （每唯一 block state 一次几何+纹理判定，之后查询为 O(1)）
+        BuildBlockOcclusionTable(lastOcclusionBuilt);
+        lastOcclusionBuilt = globalBlockPalette.size();
         size_t newlyLoaded = (afterLoad > beforeLoad) ? (afterLoad - beforeLoad) : 0;
 
         // 处理天空光照邻居标志(在模型线程前执行,避免写冲突)
@@ -231,6 +239,33 @@ void RegionModelExporter::ExportModels(const string& outputName) {
             tasksInCurrentBatch += group.tasks.size();
         }
 
+        // 预生成批次内所有区块的生物群系地图(串行执行)。
+        // 旧实现在模型线程内懒加载区块并写群系数据,与其它模型线程
+        // 无锁读取 sectionCache/群系表形成数据竞争,这里统一提前到加载阶段。
+        {
+            std::unordered_set<std::pair<int, int>, pair_hash> batchChunks;
+            for (const auto& group : groupsInBatch) {
+                for (const auto& task : group.tasks) {
+                    batchChunks.emplace(task.chunkX, task.chunkZ);
+                }
+            }
+            for (const auto& ck : batchChunks) {
+                if (processedBiomeChunks.find(ck) != processedBiomeChunks.end()) continue;
+                // 确保区块数据已加载(填充高度图),再生成生物群系地图
+                {
+                    std::shared_lock<std::shared_mutex> sc_lk(sectionCacheMutex);
+                    auto k0 = std::make_tuple(ck.first, ck.second, 0);
+                    bool needLoad = sectionCache.find(k0) == sectionCache.end();
+                    sc_lk.unlock();
+                    if (needLoad) {
+                        LoadAndCacheBlockData(ck.first, ck.second);
+                    }
+                }
+                Biome::GenerateBiomeMap(ck.first * 16, ck.second * 16, ck.first * 16 + 15, ck.second * 16 + 15);
+                processedBiomeChunks.insert(ck);
+            }
+        }
+
         // 重置当前批次的完成任务计数
         std::atomic<size_t> batchCompletedTasks{0};
 
@@ -239,6 +274,8 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         const unsigned numThreads = std::max<unsigned>(1,
             std::min<unsigned>(static_cast<unsigned>(config.modelThreads),
                                static_cast<unsigned>(std::max<size_t>(1, groupsInBatch.size()))));
+        // 通知去重层限制内部并行度,避免线程数量爆炸
+        SetModelThreadBudget(static_cast<int>(numThreads));
         std::atomic<size_t> groupIndex{0};
         std::vector<std::thread> threads;
         threads.reserve(numThreads);
@@ -258,7 +295,7 @@ void RegionModelExporter::ExportModels(const string& outputName) {
                         groupModel.faces.reserve(8192 * reserveTasks);
                         groupModel.uvCoordinates.reserve(4096 * reserveTasks);
                         std::unordered_map<string, string> localMaterials;
-                        std::unordered_map<string, int8_t> localTints;
+                        std::unordered_map<string, TintResult> localTints;
 
                         // 记录当前组内需要处理的任务数
                         size_t tasksInCurrentGroup = group.tasks.size();
@@ -266,32 +303,6 @@ void RegionModelExporter::ExportModels(const string& outputName) {
 
                         // 合并组内所有区块模型
                         for (const auto& task : group.tasks) {
-                            // 为当前区块生成生物群系地图数据 (如果尚未生成)
-                            std::pair<int, int> chunkKey = {task.chunkX, task.chunkZ};
-                            {
-                                std::lock_guard<std::mutex> lock(biomeMutex);
-                                if (processedBiomeChunks.find(chunkKey) == processedBiomeChunks.end()) {
-                                    // 计算当前区块的方块坐标范围
-                                    int blockXStart = task.chunkX * 16;
-                                    int blockXEnd = blockXStart + 15;
-                                    int blockZStart = task.chunkZ * 16;
-                                    int blockZEnd = blockZStart + 15;
-                                    // 确保区块数据已加载(填充高度图),再生成生物群系地图
-                                    {
-                                        std::shared_lock<std::shared_mutex> sc_lk(sectionCacheMutex);
-                                        auto k0 = std::make_tuple(task.chunkX, task.chunkZ, 0);
-                                        bool needLoad = sectionCache.find(k0) == sectionCache.end();
-                                        sc_lk.unlock();
-                                        if (needLoad) {
-                                            LoadAndCacheBlockData(task.chunkX, task.chunkZ);
-                                        }
-                                    }
-                                    // 生成该区块的生物群系地图数据
-                                    Biome::GenerateBiomeMap(blockXStart, blockZStart, blockXEnd, blockZEnd);
-                                    processedBiomeChunks.insert(chunkKey);
-                                }
-                            }
-
                             // processModel 返回可移动对象；提前 reserve 随即会被移动赋值
                             // 丢弃，旧代码每个 section 都做了三次无效分配。
                             ModelData chunkModel = processModel(task);
@@ -329,7 +340,7 @@ void RegionModelExporter::ExportModels(const string& outputName) {
                         }
                         if (groupModel.vertices.empty()) continue;
                         for (const auto& mat : groupModel.materials)
-                            if (mat.tintIndex != -1) localTints[mat.name] = mat.tintIndex;
+                            localTints[mat.name] = mat.tint;
                         if (config.exportFullModel) {
                             mergeToFinalModel(std::move(groupModel));
                         } else {
@@ -421,6 +432,13 @@ void RegionModelExporter::ExportModels(const string& outputName) {
         { CrafterLog::StageTimer t("写入模型文件");
         monitor.SetStatus(TaskStatus::EXPORTING_MODELS, "CreateModelFiles");
         CreateModelFiles(finalMergedModel, outputName);
+        }
+        // 全模型路径同样输出 tint.json
+        { CrafterLog::StageTimer t("写入 tint.json");
+        std::unordered_map<string, TintResult> fullModelTints;
+        for (const auto& mat : finalMergedModel.materials)
+            fullModelTints[mat.name] = mat.tint;
+        CreateTintJsonFile(fullModelTints);
         }
     }
     else if (!uniqueMaterials.empty()) {

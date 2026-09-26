@@ -58,8 +58,10 @@ bool ReadChunkNbt(const std::vector<char>& region, size_t slot, NbtTagPtr& root)
         if (!DecompressData(packed, raw)) return false;
     } else if (compression == 3) {
         raw = std::move(packed);
+    } else if (compression == 1) {
+        if (!DecompressGzip(packed, raw)) return false;
     } else {
-        // 现代实体区域通常为 zlib。gzip/外部流留作降级跳过。
+        // 未知压缩类型,跳过该区块
         return false;
     }
     try {
@@ -160,7 +162,9 @@ size_t Export(const std::string& outputPath) {
     result["entities"] = json::array();
     fs::path dir = GetEntitiesDirectory();
     if (!fs::exists(dir)) {
-        std::ofstream(outputPath) << result.dump(2);
+        std::ofstream out(outputPath);
+        if (out) out << result.dump(2);
+        else std::cerr << "[Entities] 无法写入: " << outputPath << std::endl;
         std::cout << "[Entities] Directory not found: " << dir.string() << std::endl;
         return 0;
     }
@@ -168,6 +172,10 @@ size_t Export(const std::string& outputPath) {
     for (const auto& entry : fs::directory_iterator(dir)) {
         if (!entry.is_regular_file() || entry.path().extension() != ".mca") continue;
         std::ifstream in(entry.path(), std::ios::binary);
+        if (!in) {
+            std::cerr << "[Entities] 无法打开区域文件: " << entry.path().string() << std::endl;
+            continue;
+        }
         std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         for (size_t slot = 0; slot < 1024; ++slot) {
             NbtTagPtr root;
@@ -180,6 +188,10 @@ size_t Export(const std::string& outputPath) {
         }
     }
     std::ofstream out(outputPath, std::ios::binary);
+    if (!out) {
+        std::cerr << "[Entities] 无法写入输出文件: " << outputPath << std::endl;
+        return 0;
+    }
     out << result.dump(2);
     std::cout << "[Entities] Exported " << result["entities"].size()
               << " entities from " << chunks << " chunks -> " << outputPath << std::endl;

@@ -17,6 +17,7 @@
 // --- 项目头文件 ---
 #include "config.h"
 #include "block.h"
+#include "Occlusion.h"
 #include "RegionCache.h"
 #include "model.h"
 #include "EntityBlock.h"
@@ -166,14 +167,22 @@ void ProcessSection(int chunkX, int chunkZ, int sectionY, const NbtTagPtr& secti
     if (bio) {
         // 旧版格式(1.18~1.19)：biomes 是 INT_ARRAY，64 个 biome registry ID
         if (bio->type == TagType::INT_ARRAY) {
-            const int* ids = reinterpret_cast<const int*>(bio->payload.data());
-            size_t count = bio->payload.size() / sizeof(int);
+            // NBT 数组按大端字节序保存,必须逐元素转换;
+            // 旧实现用 reinterpret_cast<const int*> 直接取数,在小端机器上
+            // 会得到字节颠倒的 biome ID(1.18~1.19 群系颜色错乱)。
+            const auto& payload = bio->payload;
+            size_t count = payload.size() / 4;
             biomeData.resize(64, 0);
             for (size_t i = 0; i < count && i < 64; ++i) {
-                int rawId = ids[i];
+                const size_t base = i * 4;
+                uint32_t rawId = (static_cast<uint32_t>(static_cast<uint8_t>(payload[base])) << 24) |
+                    (static_cast<uint32_t>(static_cast<uint8_t>(payload[base + 1])) << 16) |
+                    (static_cast<uint32_t>(static_cast<uint8_t>(payload[base + 2])) << 8) |
+                    static_cast<uint32_t>(static_cast<uint8_t>(payload[base + 3]));
+                int biomeId = static_cast<int32_t>(rawId);
                 // 用 ID 生成占位名，确保 biome 被注册
                 std::string name = "minecraft:legacy_biome_";
-                name += std::to_string(rawId);
+                name += std::to_string(biomeId);
                 biomeData[i] = Biome::GetId(name);
             }
         }
@@ -589,8 +598,9 @@ void LoadAndCacheBlockData(int chunkX, int chunkZ) {
         int regionX, regionZ;
         chunkToRegion(chunkX, chunkZ, regionX, regionZ);
 
-        // 获取区域数据
-        const auto& regionData = GetRegionFromCache(regionX, regionZ);
+        // 获取区域数据(shared_ptr 保证解析期间数据有效,不受缓存清空影响)
+        auto regionDataPtr = GetRegionFromCache(regionX, regionZ);
+        const auto& regionData = *regionDataPtr;
 
         // 获取区块数据
         std::vector<char> chunkData = GetChunkNBTData(regionData, chunkX, chunkZ);
@@ -665,6 +675,9 @@ void LoadAndCacheBlockData(int chunkX, int chunkZ) {
 // 方块ID查询相关函数
 // --------------------------------------------------------------------------------
 // 获取方块ID
+// 注意:该函数是模型阶段的高频只读路径,不带锁。
+// 依赖调用约定:模型线程运行期间 sectionCache 不会被写入
+// (区块加载/卸载均在批次加载阶段串行完成),见 RegionModelExporter::ExportModels。
 int GetBlockId(int blockX, int blockY, int blockZ) {
     int chunkX, chunkZ;
     blockToChunk(blockX, blockZ, chunkX, chunkZ);
@@ -686,13 +699,11 @@ int GetBlockId(int blockX, int blockY, int blockZ) {
     return (yzx < blockData.size()) ? blockData[yzx] : 0;
 }
 
-// 获取方块ID时同时获取相邻方块的air状态,返回当前方块ID
-int GetBlockIdWithNeighbors(int blockX, int blockY, int blockZ, bool* neighborIsAir, int* fluidLevels) {
+// 获取方块ID时同时获取六个方向"邻居是否不遮挡"（true = 该方向的面应渲染），返回当前方块ID。
+// 遮挡判定来自运行时自建遮挡表（Occlusion.h），等价于原版 canOcclude()；水面单独走
+// 原版 FluidRenderer 的逐面规则（见 ChunkGenerator）。
+int GetBlockIdWithNeighbors(int blockX, int blockY, int blockZ, bool* neighborIsAir) {
     int currentId = GetBlockId(blockX, blockY, blockZ);
-    Block currentBlock = GetBlockById(currentId);
-    std::string currentBaseName = currentBlock.GetNameAndNameSpaceWithoutState();
-
-    bool hasFluidData = currentBlock.HasFluid();
 
     // 统一处理 neighborIsAir 数组(6个方向)
     if (neighborIsAir != nullptr) {
@@ -722,46 +733,7 @@ int GetBlockIdWithNeighbors(int blockX, int blockY, int blockZ, bool* neighborIs
             }
 
             int neighborId = GetBlockId(nx, ny, nz);
-            Block neighborBlock = GetBlockById(neighborId);
-
-            if (hasFluidData) {
-                bool isSameFluid = neighborBlock.HasFluid() &&
-                    currentBlock.fluidName == neighborBlock.fluidName;
-                // Only render water side faces next to true air blocks.
-                // Solid/transparent/mod blocks (even if absent from the solids
-                // table) hide the water side, avoiding a visible water sheet
-                // hugging full blocks.
-                std::string neighborBase = neighborBlock.GetNameAndNameSpaceWithoutState();
-                bool isTrueAir = (neighborBase == "minecraft:air" ||
-                                  neighborBase == "minecraft:cave_air" ||
-                                  neighborBase == "minecraft:void_air");
-                neighborIsAir[i] = !isSameFluid && (isTrueAir || neighborBlock.HasFluid());
-            }
-            else {
-                neighborIsAir[i] = neighborBlock.air;
-            }
-        }
-    }
-
-    // 处理 fluidLevels 数组,仅在存在流体数据且数组不为空时进行
-    if (hasFluidData && fluidLevels != nullptr) {
-        // 中心块的流体等级
-        fluidLevels[0] = GetLevel(blockX, blockY, blockZ, currentBlock.fluidName);
-        static const std::array<std::tuple<int, int, int>, 9> levelDirections = { {
-            {0, 0, -1},   // 北
-            {0, 0, 1},    // 南
-            {1, 0, 0},    // 东
-            {-1, 0, 0},   // 西
-            {1, 0, -1},   // 东北
-            {-1, 0, -1},  // 西北
-            {1, 0, 1},    // 东南
-            {-1, 0, 1},   // 西南
-            {0, 1, 0}     // 上
-        } };
-        for (size_t i = 0; i < levelDirections.size(); ++i) {
-            int dx, dy, dz;
-            std::tie(dx, dy, dz) = levelDirections[i];
-            fluidLevels[i + 1] = GetLevel(blockX + dx, blockY + dy, blockZ + dz, currentBlock.fluidName);
+            neighborIsAir[i] = !GetBlockOcclusion(neighborId).occludes;
         }
     }
 
@@ -817,30 +789,6 @@ int GetHeightMapY(int blockX, int blockZ, const std::string& heightMapType) {
     int result = (index < 256 && index < typeIter->second.size()) ? typeIter->second[index] : -1;
     // lock 在此处自动解锁
     return result;
-}
-
-int GetLevel(int blockX, int blockY, int blockZ, const std::string& expectedFluidName) {
-    int currentId = GetBlockId(blockX, blockY, blockZ);
-    Block currentBlock = GetBlockById(currentId);
-    if (currentBlock.HasFluid() &&
-        (expectedFluidName.empty() || currentBlock.fluidName == expectedFluidName)) {
-        // 检查上方方块
-        int upperId = GetBlockId(blockX, blockY + 1, blockZ);
-        Block upperBlock = GetBlockById(upperId);
-        if (upperBlock.HasFluid() && upperBlock.fluidName == currentBlock.fluidName) {
-            return FULL_FLUID_LEVEL;
-        }
-        else {
-            return currentBlock.level; // 当前流体level
-        }
-    }
-
-    // Any non-air block (opaque or transparent, even if not in solids table)
-    // presses the water surface to full height. Otherwise a ~0.11 block air gap
-    // appears between the water top and the block bottom.
-    std::string baseName = currentBlock.GetNameAndNameSpaceWithoutState();
-    bool isAirBlock = (baseName == "minecraft:air" || baseName == "minecraft:cave_air" || baseName == "minecraft:void_air");
-    return isAirBlock ? -1 : -2;
 }
 
 int GetSkyLight(int blockX, int blockY, int blockZ) {

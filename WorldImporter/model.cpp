@@ -585,19 +585,11 @@ nlohmann::json MergeModelJson(const nlohmann::json& parentModelJson, const nlohm
         }
     }
 
-    // 合并 "elements"
-    if (parentModelJson.contains("elements")) {
-        if (currentModelJson.contains("elements")) {
-            // 两者都有elements，合并数组
-            mergedModelJson["elements"] = currentModelJson["elements"];
-            // 将父模型中的elements添加到子模型elements后面
-            for (const auto& element : parentModelJson["elements"]) {
-                mergedModelJson["elements"].push_back(element);
-            }
-        } else {
-            // 子模型没有elements，使用父模型的
-            mergedModelJson["elements"] = parentModelJson["elements"];
-        }
+    // Minecraft 模型继承语义：子模型一旦声明 elements，就完整替换父模型
+    // 的 elements，而不是追加。旧实现把两者拼接，会让自定义 top/bottom slab
+    // 同时生成两套几何；重合面随后被偏移/去重，表现为半砖缺面或上下错位。
+    if (!currentModelJson.contains("elements") && parentModelJson.contains("elements")) {
+        mergedModelJson["elements"] = parentModelJson["elements"];
     }
 
     // 合并 "display"
@@ -1118,8 +1110,11 @@ void processElements(const nlohmann::json& modelJson, ModelData& data,
                             !seenMaterials.contains(currentMaterialIndex);
 
                         if (config.allowDoubleFace || isLayeredMaterial) {
+                            // 共面叠加层(如草方块侧面的 overlay 元素)逐层沿法线外移,
+                            // 步长与 CTM overlay 共用 config.overlayLayerStep,
+                            // 保证 Blender/Eevee 下各层不再共面。
                             int count = ++faceCountMap[key];
-                            float offset = (count - 1) * 0.001f;
+                            float offset = (count - 1) * config.overlayLayerStep;
                             for (auto& v : faceVertices) {
                                 v[0] += crossX * offset;
                                 v[1] += crossY * offset;
@@ -1302,6 +1297,8 @@ void processElements(const nlohmann::json& modelJson, ModelData& data,
                     if (face.value().contains("tintindex")) {
                         localTintIndex = face.value()["tintindex"].get<int>();
                     }
+                    // 面级 tintindex(用于导出阶段的逐面色型解析)
+                    data.faces.back().tintIndex = static_cast<int8_t>(localTintIndex);
                     // 更新此材质的tintIndex
                     if (!data.materials.empty() && data.faces.back().materialIndex >= 0 && data.faces.back().materialIndex < data.materials.size()) {
                         data.materials[data.faces.back().materialIndex].tintIndex = localTintIndex;
@@ -1557,6 +1554,7 @@ ModelData MergeModelData(const ModelData& data1, const ModelData& data2) {
             
             // 保留面方向
             newFace.faceDirection = face.faceDirection;
+            newFace.tintIndex = face.tintIndex;
             
             mergedData.faces.push_back(newFace);
         }
@@ -1743,6 +1741,7 @@ ModelData MergeFluidModelData(const ModelData& data1, const ModelData& data2) {
             
             // 保留面方向
             newFace.faceDirection = face.faceDirection;
+            newFace.tintIndex = face.tintIndex;
             
             mergedData.faces.push_back(newFace);
         }
@@ -1922,6 +1921,7 @@ ModelData MergeFluidModelData(const ModelData& data1, const ModelData& data2) {
         newFace.vertexIndices = faceIndices;
         newFace.materialIndex = (data2.faces[i].materialIndex != -1) ? materialIndexMap[data2.faces[i].materialIndex] : -1;
         newFace.faceDirection = data2.faces[i].faceDirection;
+        newFace.tintIndex = data2.faces[i].tintIndex;
         mergedData.faces.push_back(newFace);
 
         // 对应的UV面处理
@@ -2033,6 +2033,7 @@ void MergeModelsDirectly(ModelData& data1, const ModelData& data2) {
         
         // 保留面方向
         newFace.faceDirection = face.faceDirection;
+        newFace.tintIndex = face.tintIndex;
         
         data1.faces.push_back(newFace);
     }
