@@ -16,9 +16,6 @@ using namespace std;
  * @return unsigned 区块在文件中的偏移量字节位置，失败返回0
  */
 unsigned CalculateChunkOffset(const std::vector<char>& fileData, int x, int z) {
-    if (x < 0 || x >= 32 || z < 0 || z >= 32 || fileData.size() < 8192) {
-        return 0;
-    }
     // 计算索引位置(每个索引占4字节)
     unsigned index = 4 * (x + z * 32);
     
@@ -80,11 +77,8 @@ std::vector<char> GetChunkNBTData(const std::vector<char>& fileData, int x, int 
     int localZ = mod32(z);
     unsigned offset = CalculateChunkOffset(fileData, localX, localZ);
     
-    const unsigned sectorCount = static_cast<unsigned char>(
-        fileData[4 * (localX + localZ * 32) + 3]);
-    if (offset < 8192 || sectorCount == 0 || offset > fileData.size() ||
-        fileData.size() - offset < 5) {
-        cerr << "Invalid chunk location or truncated header." << endl;
+    if (offset == 0) {
+        cerr << "错误: 偏移计算失败." << endl;
         return {};
     }
 
@@ -93,8 +87,7 @@ std::vector<char> GetChunkNBTData(const std::vector<char>& fileData, int x, int 
     
     // 根据 length 和 offset 检查整个区块数据是否在文件范围内
     uint64_t endOffset = static_cast<uint64_t>(offset) + 4 + length;
-    if (length <= 1 || endOffset > fileData.size() ||
-        static_cast<uint64_t>(length) + 4 > static_cast<uint64_t>(sectorCount) * 4096) {
+    if (length == 0 || endOffset > fileData.size()) {
         cerr << "错误: 区块数据超出了文件边界." << endl;
         return {};
     }
