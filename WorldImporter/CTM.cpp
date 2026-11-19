@@ -34,6 +34,11 @@
 
 // ========= 规则索引 =========
 static std::vector<CtmRule> g_ctmRules;
+// OptiFine 命名 tile（tiles=glass_00 glass_01 ...）：
+// key = "ns|baseDir|id" -> 文件名 stem；数字 tile 不登记。
+// 命名 tile 用全局递增 id，避免不同颜色规则共用 baseDir+0..4 时互相覆盖。
+static std::unordered_map<std::string, std::string> g_ctmTileNames;
+static int g_ctmNamedTileSerial = 100000;
 // 按 matchBlocks 索引: "ns:blockName" -> 规则下标列表
 static std::unordered_map<std::string, std::vector<size_t>> g_rulesByBlock;
 // 按 matchTiles 索引: "ns:textureName" -> 规则下标列表
@@ -130,9 +135,22 @@ static std::vector<std::string> SplitComma(const std::string& s) {
     return out;
 }
 
-// 解析 tiles 字段,支持 "0-4" / "0 1 2" / "10-14" 混合
-static std::vector<int> ParseTiles(const std::string& s) {
+// 解析 tiles 字段,支持 "0-4" / "0 1 2" / "10-14" 混合,
+// 也支持 OptiFine 的命名 tile（如 "glass_00 glass_01"）。
+static std::vector<int> ParseTiles(const std::string& s, std::vector<std::string>* names = nullptr) {
     std::vector<int> out;
+    if (names) names->clear();
+    auto pushIndex = [&](int value) {
+        out.push_back(value);
+        if (names) names->push_back("");
+    };
+    auto pushName = [&](const std::string& name) {
+        if (!names) return;
+        // 命名 tile 不能只用 out.size()：玻璃各种颜色共用 optifine/ctm，
+        // 0..4 会互相覆盖，最后所有颜色都读成同一条规则。
+        out.push_back(g_ctmNamedTileSerial++);
+        names->push_back(name);
+    };
     std::stringstream ss(s);
     std::string token;
     while (ss >> token) {
@@ -147,17 +165,30 @@ static std::vector<int> ParseTiles(const std::string& s) {
                     int a = std::stoi(part.substr(0, dash));
                     int b = std::stoi(part.substr(dash + 1));
                     if (a > b) std::swap(a, b);
-                    for (int i = a; i <= b; ++i) out.push_back(i);
+                    for (int i = a; i <= b; ++i) pushIndex(i);
                 }
                 catch (...) {}
             }
             else {
-                try { out.push_back(std::stoi(part)); }
-                catch (...) {}
+                try { pushIndex(std::stoi(part)); }
+                catch (...) { pushName(part); }
             }
         }
     }
     return out;
+}
+
+// 取 tile 的文件名 stem：命名 tile 用原名，数字 tile 用两位编号。
+static std::string CtmTileStem(const std::string& ns, const std::string& baseDir, int tileIndex) {
+    auto it = g_ctmTileNames.find(ns + "|" + baseDir + "|" + std::to_string(tileIndex));
+    if (it != g_ctmTileNames.end()) return it->second;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02d", tileIndex);
+    return buf;
+}
+
+static bool CtmTileIsNamed(const std::string& ns, const std::string& baseDir, int tileIndex) {
+    return g_ctmTileNames.find(ns + "|" + baseDir + "|" + std::to_string(tileIndex)) != g_ctmTileNames.end();
 }
 
 static CtmMethod ParseMethod(const std::string& m) {
@@ -522,7 +553,7 @@ void InitializeCtmRules() {
         }
         if (kv.count("method")) rule.method = ParseMethod(kv["method"]);
         else rule.method = CtmMethod::Unknown;
-        if (kv.count("tiles")) rule.tiles = ParseTiles(kv["tiles"]);
+        if (kv.count("tiles")) rule.tiles = ParseTiles(kv["tiles"], &rule.tileNames);
         if (kv.count("faces")) rule.faces = SplitComma(kv["faces"]);
         if (kv.count("connect")) rule.connect = kv["connect"];
         if (kv.count("width")) { try { rule.width = std::stoi(kv["width"]); } catch (...) {} }
@@ -581,6 +612,12 @@ void InitializeCtmRules() {
 
         size_t idx = g_ctmRules.size();
         g_ctmRules.push_back(std::move(rule));
+        for (size_t i = 0; i < g_ctmRules[idx].tiles.size(); ++i) {
+            if (i < g_ctmRules[idx].tileNames.size() && !g_ctmRules[idx].tileNames[i].empty()) {
+                g_ctmTileNames[g_ctmRules[idx].ns + "|" + g_ctmRules[idx].baseDir + "|" +
+                    std::to_string(g_ctmRules[idx].tiles[i])] = g_ctmRules[idx].tileNames[i];
+            }
+        }
 
         // 建立索引: 通配 matchBlocks(以 '_' 开头)单独存放,精确的进 hash 索引
         for (const auto& fullBlock : g_ctmRules[idx].matchBlocks) {
@@ -806,6 +843,29 @@ static bool MatchTileEntry(const std::string& entry, const std::string& entryNs,
     return false;
 }
 
+// 前置声明：规则选择时需要快速判断该规则有没有法线 tile，
+// 避免 Continuity 内置的纯 albedo 规则把带 _n 的资源包规则顶掉。
+static bool LoadCtmTilePngBytesWithFallback(const std::string& ns, const std::string& baseDir,
+    int tileIndex, std::vector<unsigned char>& outBytes, const std::string& suffix);
+
+// 规则是否有任意一张 _n；按规则下标缓存，避免每面都去读盘。
+static bool RuleHasNormalTile(size_t ruleIndex) {
+    static thread_local std::unordered_map<size_t, bool> cache;
+    auto cached = cache.find(ruleIndex);
+    if (cached != cache.end()) return cached->second;
+    bool has = false;
+    const CtmRule& rule = g_ctmRules[ruleIndex];
+    for (int t : rule.tiles) {
+        std::vector<unsigned char> bytes;
+        if (LoadCtmTilePngBytesWithFallback(rule.ns, rule.baseDir, t, bytes, "_n") && !bytes.empty()) {
+            has = true;
+            break;
+        }
+    }
+    cache[ruleIndex] = has;
+    return has;
+}
+
 const CtmRule* FindCtmRule(const std::string& blockNs,
     const std::string& blockName,
     const std::string& textureNs,
@@ -849,58 +909,54 @@ const CtmRule* FindCtmRule(const std::string& blockNs,
         }
         return true;
     };
+    // 同一目标可能同时命中 Continuity 内置规则和资源包规则。优先选带 _n 的规则，
+    // 否则玻璃等方块会先命中纯 albedo 的 CTM，法线永远没机会生成。
+    auto pick = [&](const std::vector<size_t>& candidates) -> const CtmRule* {
+        const CtmRule* fallback = nullptr;
+        for (size_t idx : candidates) {
+            if (!eligible(idx)) continue;
+            if (RuleHasNormalTile(idx)) return &g_ctmRules[idx];
+            if (fallback == nullptr) fallback = &g_ctmRules[idx];
+        }
+        return fallback;
+    };
+    // 收集所有可能命中的规则，再统一 pick：matchTiles 规则没有法线时，
+    // 仍可以退到同一方块、带 _n 的 matchBlocks 规则（例如 FPBR 的玻璃 CTM）。
+    std::vector<size_t> candidates;
+    auto addBucket = [&](const std::unordered_map<std::string, std::vector<size_t>>& index,
+                         const std::string& key) {
+        auto it = index.find(key);
+        if (it == index.end()) return;
+        for (size_t idx : it->second) candidates.push_back(idx);
+    };
     // 优先按 matchTiles 匹配(更具体),再按 matchBlocks
-    {
-        auto it = g_rulesByTile.find(textureNs + ":" + textureName);
-        if (it != g_rulesByTile.end()) {
-            for (size_t idx : it->second)
-                if (eligible(idx)) return &g_ctmRules[idx];
-        }
-        size_t slash = textureName.find_last_of('/');
-        std::string shortName = slash == std::string::npos ? textureName : textureName.substr(slash + 1);
-        if (slash == std::string::npos) {
-            // 贴图名本身就是短名(road): 短名条目按 block/ 约定指向 block/road
-            auto it2 = g_rulesByTile.find(textureNs + ":block/" + textureName);
-            if (it2 != g_rulesByTile.end()) {
-                for (size_t idx : it2->second)
-                    if (eligible(idx)) return &g_ctmRules[idx];
-            }
-        } else {
-            // matchTiles 可能只写了短名(如 "glass"),textureName 可能是 "block/glass"
-            // 尝试取 textureName 末尾段
-            auto it2 = g_rulesByTile.find(textureNs + ":" + shortName);
-            if (it2 != g_rulesByTile.end()) {
-                for (size_t idx : it2->second)
-                    if (eligible(idx)) return &g_ctmRules[idx];
-            }
-        }
+    addBucket(g_rulesByTile, textureNs + ":" + textureName);
+    size_t slash = textureName.find_last_of('/');
+    std::string shortName = slash == std::string::npos ? textureName : textureName.substr(slash + 1);
+    if (slash == std::string::npos) {
+        // 贴图名本身就是短名(road): 短名条目按 block/ 约定指向 block/road
+        addBucket(g_rulesByTile, textureNs + ":block/" + textureName);
+    } else {
+        // matchTiles 可能只写了短名(如 "glass"),textureName 可能是 "block/glass"
+        // 尝试取 textureName 末尾段
+        addBucket(g_rulesByTile, textureNs + ":" + shortName);
     }
-    {
-        // 以 '_' 结尾的 matchTiles: 命中即按注册顺序取首条(前缀族是否生效见 MatchTileEntry)
-        size_t slash = textureName.find_last_of('/');
-        std::string shortName = slash == std::string::npos ? textureName : textureName.substr(slash + 1);
-        for (const auto& pr : g_prefixTileRules) {
-            if (!MatchTileEntry(std::get<1>(pr), std::get<0>(pr), textureNs, textureName, shortName))
-                continue;
-            if (eligible(std::get<2>(pr))) return &g_ctmRules[std::get<2>(pr)];
-        }
+    // 以 '_' 结尾的 matchTiles: 命中即按注册顺序取首条(前缀族是否生效见 MatchTileEntry)
+    for (const auto& pr : g_prefixTileRules) {
+        if (!MatchTileEntry(std::get<1>(pr), std::get<0>(pr), textureNs, textureName, shortName))
+            continue;
+        candidates.push_back(std::get<2>(pr));
     }
-    {
-        auto it = g_rulesByBlock.find(blockNs + ":" + blockName);
-        if (it != g_rulesByBlock.end()) {
-            for (size_t idx : it->second)
-                if (eligible(idx)) return &g_ctmRules[idx];
-        }
-        // 通配匹配 _stained_glass 等(只在少量通配规则中后缀匹配)
-        for (const auto& wc : g_wildcardBlockRules) {
-            const std::string& wns = std::get<0>(wc);
-            const std::string& pattern = std::get<1>(wc);
-            size_t idx = std::get<2>(wc);
-            if (wns != blockNs) continue;
-            if (MatchBlockName(pattern, blockName) && eligible(idx))
-                return &g_ctmRules[idx];
-        }
+    addBucket(g_rulesByBlock, blockNs + ":" + blockName);
+    // 通配匹配 _stained_glass 等(只在少量通配规则中后缀匹配)
+    for (const auto& wc : g_wildcardBlockRules) {
+        const std::string& wns = std::get<0>(wc);
+        const std::string& pattern = std::get<1>(wc);
+        size_t idx = std::get<2>(wc);
+        if (wns != blockNs) continue;
+        if (MatchBlockName(pattern, blockName)) candidates.push_back(idx);
     }
+    if (const CtmRule* r = pick(candidates)) return r;
     return nullptr;
 }
 
@@ -1193,10 +1249,11 @@ static bool LoadCtmTilePngBytes(const std::string& ns, const std::string& tileRe
 // tile 原始 PNG 字节读取(两位/一位文件名回退)；suffix 用于读取 PBR 变体
 static bool LoadCtmTilePngBytesWithFallback(const std::string& ns, const std::string& baseDir,
     int tileIndex, std::vector<unsigned char>& outBytes, const std::string& suffix) {
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%02d", tileIndex);
-    if (LoadCtmTilePngBytes(ns, baseDir + "/" + buf + suffix, outBytes)) return true;
-    if (LoadCtmTilePngBytes(ns, baseDir + "/" + std::to_string(tileIndex) + suffix, outBytes)) return true;
+    const std::string stem = CtmTileStem(ns, baseDir, tileIndex);
+    if (LoadCtmTilePngBytes(ns, baseDir + "/" + stem + suffix, outBytes)) return true;
+    // 数字 tile 仍兼容一位编号；命名 tile 不做数字回退
+    if (!CtmTileIsNamed(ns, baseDir, tileIndex) && stem != std::to_string(tileIndex) &&
+        LoadCtmTilePngBytes(ns, baseDir + "/" + std::to_string(tileIndex) + suffix, outBytes)) return true;
     return false;
 }
 
@@ -1309,17 +1366,15 @@ static std::string ShortHash4(const std::string& text) {
 // 获取或创建一个 CTM 材质信息(模板)。仅保存"整张 tile"类型(horizontal/vertical/ctm/compact-fallback)。
 // tileIndex: tile 编号
 static CtmTexInfo GetOrCreateTileTexInfo(const std::string& ns, const std::string& baseDir, int tileIndex) {
-    char tileNameBuf[8];
-    snprintf(tileNameBuf, sizeof(tileNameBuf), "%02d", tileIndex);
-    std::string id = ns + "|" + baseDir + "|t" + tileNameBuf;
+    const std::string fileName = CtmTileStem(ns, baseDir, tileIndex);
+    std::string id = ns + "|" + baseDir + "|t" + fileName;
     {
         std::lock_guard<std::mutex> lk(g_ctmTexCacheMutex);
         auto it = g_ctmTexCache.find(id);
         if (it != g_ctmTexCache.end()) return it->second;
     }
     CtmTexInfo info;
-    // OptiFine tile 文件名约定为两位数字: 01.png ~ 16.png (与 properties 中 tiles=01 02 ... 对应)
-    std::string fileName = std::string(tileNameBuf);
+    // OptiFine 数字 tile 约定为两位编号; 命名 tile 直接用原名（glass_00 等）
     info.materialName = BuildCtmMaterialName(ns, baseDir, fileName);
     info.shortId = "ctm/" + fileName + "_" + ShortHash4(baseDir);
     info.texturePath = BuildCtmTextureRelPath(ns, baseDir, fileName);
@@ -1388,18 +1443,19 @@ static std::unordered_map<std::string, CtmAtlasInfo> g_ctmAtlasCache;
 static bool LoadCtmTilePixelsWithFallback(const std::string& ns, const std::string& baseDir,
     int tileIndex, std::vector<unsigned char>& px, int& w, int& h,
     const std::string& suffix = "") {
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%02d", tileIndex);
-    if (LoadCtmTilePixels(ns, baseDir + "/" + buf + suffix, px, w, h)) return true;
-    if (LoadCtmTilePixels(ns, baseDir + "/" + std::to_string(tileIndex) + suffix, px, w, h)) return true;
+    const std::string stem = CtmTileStem(ns, baseDir, tileIndex);
+    if (LoadCtmTilePixels(ns, baseDir + "/" + stem + suffix, px, w, h)) return true;
+    if (!CtmTileIsNamed(ns, baseDir, tileIndex) && stem != std::to_string(tileIndex) &&
+        LoadCtmTilePixels(ns, baseDir + "/" + std::to_string(tileIndex) + suffix, px, w, h)) return true;
     return false;
 }
 
 // tile 是否带 animation mcmeta(动画 tile 不参与 atlas)
 static bool CtmTileHasAnimation(const std::string& ns, const std::string& baseDir, int tileIndex) {
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%02d", tileIndex);
-    const std::string rels[2] = { baseDir + "/" + buf, baseDir + "/" + std::to_string(tileIndex) };
+    const std::string stem = CtmTileStem(ns, baseDir, tileIndex);
+    std::vector<std::string> rels = { baseDir + "/" + stem };
+    if (!CtmTileIsNamed(ns, baseDir, tileIndex) && stem != std::to_string(tileIndex))
+        rels.push_back(baseDir + "/" + std::to_string(tileIndex));
     std::shared_lock<std::shared_mutex> lock(GlobalCache::cacheMutex);
     for (const auto& rel : rels) {
         std::string idxKey = "mcmetas:" + ns + ":" + rel;
@@ -1437,6 +1493,24 @@ static void GetAtlasGrid(const CtmRule& rule, int& cols, int& rows) {
     if (cols * rows < n) rows = (n + cols - 1) / cols;
 }
 
+// 该规则是否有任意一张 _n；用于区分“完全没有法线”与“法线不完整”。
+static bool CtmRuleHasAnyNormalTile(const CtmRule& rule) {
+    for (int t : rule.tiles) {
+        std::vector<unsigned char> bytes;
+        if (LoadCtmTilePngBytesWithFallback(rule.ns, rule.baseDir, t, bytes, "_n") && !bytes.empty())
+            return true;
+    }
+    return false;
+}
+
+// 删除旧 atlas 的 PBR 文件：规则回退到 per-tile 时不能留下上一轮的部分 _n 图，
+// 否则 Blender 仍会自动把它当成同名 atlas 的法线。
+static void RemoveCtmAtlasSuffixFile(const CtmRule& rule, const std::string& fileName,
+                                     const std::string& suffix) {
+    const std::string path = BuildCtmTextureFilePath(rule.ns, rule.baseDir, fileName + suffix);
+    DeleteFileW(string_to_wstring(path).c_str());
+}
+
 static CtmAtlasInfo GetOrCreateRuleAtlas(const CtmRule& rule) {
     CtmAtlasInfo result;
     const int n = static_cast<int>(rule.tiles.size());
@@ -1447,7 +1521,10 @@ static CtmAtlasInfo GetOrCreateRuleAtlas(const CtmRule& rule) {
 
     // 唯一签名: 网格 + tile 列表
     std::string sig = "a" + std::to_string(cols) + "x" + std::to_string(rows);
-    for (int t : rule.tiles) sig += "_" + std::to_string(t);
+    for (size_t i = 0; i < rule.tiles.size(); ++i) {
+        const std::string stem = CtmTileStem(rule.ns, rule.baseDir, rule.tiles[i]);
+        sig += "_" + stem;
+    }
     std::string id = rule.ns + "|" + rule.baseDir + "|" + sig;
     {
         std::lock_guard<std::mutex> lk(g_ctmTexCacheMutex);
@@ -1470,21 +1547,46 @@ static CtmAtlasInfo GetOrCreateRuleAtlas(const CtmRule& rule) {
     std::string fileName = "atlas_" + std::to_string(cols) + "x" + std::to_string(rows) + "_" +
         std::to_string(std::hash<std::string>{}(sig));
 
-    // 合成并写出指定后缀的 atlas；任一 tile 缺失或尺寸不一致则整体跳过
+    // 合成并写出指定后缀的 atlas。法线 _n 必须完整；缺一张就整条规则回退
+    // per-tile，绝不生成“部分平法线”的 atlas。_s/_a 不影响配对，允许中性补齐。
     auto buildAtlas = [&](const std::string& suffix, int& outCellW, int& outCellH) -> bool {
         std::vector<std::vector<unsigned char>> pixels;
         pixels.reserve(n);
         outCellW = 0; outCellH = 0;
+        int missing = 0;
+        auto neutralTile = [&](const std::string& suffix, int w, int h) {
+            std::vector<unsigned char> px(static_cast<size_t>(w) * h * 4, 255);
+            for (size_t i = 0; i + 3 < px.size(); i += 4) {
+                if (suffix == "_n") {
+                    // 平面法线 (0.5, 0.5, 1.0)
+                    px[i] = 128; px[i + 1] = 128; px[i + 2] = 255; px[i + 3] = 255;
+                } else if (suffix == "_s") {
+                    // 粗糙、非金属、无孔隙
+                    px[i] = 0; px[i + 1] = 0; px[i + 2] = 0; px[i + 3] = 255;
+                } else {
+                    // _a：中性高度/覆盖率
+                    px[i] = 255; px[i + 1] = 255; px[i + 2] = 255; px[i + 3] = 255;
+                }
+            }
+            return px;
+        };
         for (int t : rule.tiles) {
             std::vector<unsigned char> px; int w = 0, h = 0;
-            if (!LoadCtmTilePixelsWithFallback(rule.ns, rule.baseDir, t, px, w, h, suffix) || w <= 0 || h <= 0) {
-                return false;
+            bool loaded = LoadCtmTilePixelsWithFallback(rule.ns, rule.baseDir, t, px, w, h, suffix) && w > 0 && h > 0;
+            if (!loaded || (outCellW > 0 && (w != outCellW || h != outCellH))) {
+                // 法线不做“部分补齐”：缺一张 _n 就让整条规则回退 per-tile，
+                // 否则基础色 cell 有图案、法线 cell 是平的，合并图必然对不上。
+                if (suffix.empty() || suffix == "_n" || outCellW <= 0) return false;
+                ++missing;
+                pixels.push_back(neutralTile(suffix, outCellW, outCellH));
+                continue;
             }
             if (outCellW == 0) { outCellW = w; outCellH = h; }
-            else if (w != outCellW || h != outCellH) {
-                return false;  // 尺寸不一致
-            }
             pixels.push_back(std::move(px));
+        }
+        if (missing > 0) {
+            std::cout << "[CTM] " << rule.ns << ":" << rule.baseDir
+                      << " PBR " << suffix << " missing " << missing << " tile(s), filled neutral\n";
         }
 
         const int outW = cols * outCellW;
@@ -1509,8 +1611,25 @@ static CtmAtlasInfo GetOrCreateRuleAtlas(const CtmRule& rule) {
     int cellW = 0, cellH = 0;
     if (!buildAtlas("", cellW, cellH)) return result;  // albedo 失败则整体回退
 
-    // PBR 变体: 有就按同网格合成, 缺一个就整个后缀跳过
-    const char* pbrSuffixes[3] = { "_n", "_s", "_a" };
+    // 法线：要么完整且与基础色同格，要么整条规则回退 per-tile。
+    // 允许规则完全没有 _n（此时不生成法线 atlas），但绝不允许部分补齐。
+    const bool anyNormal = CtmRuleHasAnyNormalTile(rule);
+    if (anyNormal) {
+        int normalCellW = 0, normalCellH = 0;
+        const bool normalBuilt = buildAtlas("_n", normalCellW, normalCellH);
+        if (!normalBuilt || normalCellW != cellW || normalCellH != cellH) {
+            RemoveCtmAtlasSuffixFile(rule, fileName, "_n");
+            std::cout << "[CTM] " << rule.ns << ":" << rule.baseDir
+                      << " _n incomplete/dimension mismatch, fallback per-tile\n";
+            return result;  // 让上层走 GetOrCreateTileTexInfo，base+_n 逐 tile 成对
+        }
+    } else {
+        // 清掉上一轮可能留下的旧 _n，避免 Blender 自动配到不完整的法线图
+        RemoveCtmAtlasSuffixFile(rule, fileName, "_n");
+    }
+
+    // _s/_a 仍允许中性补齐（不影响基础色/法线配对）
+    const char* pbrSuffixes[2] = { "_s", "_a" };
     for (const char* suffix : pbrSuffixes) {
         int pbrCellW = 0, pbrCellH = 0;
         buildAtlas(suffix, pbrCellW, pbrCellH);
@@ -1762,15 +1881,19 @@ static CtmTexInfo GetOrCreateCompactTexInfo(const std::string& ns, const std::st
         return stbi_write_png(path.c_str(), outW, outH, 4, out.data(), outW * 4) != 0;
     };
 
+    bool normalWritten = false;
     if (needSave) {
         saved = buildCompact("");
-        // PBR 变体: 有就合成, 缺一个就整个后缀跳过
-        if (saved) {
-            const char* pbrSuffixes[3] = { "_n", "_s", "_a" };
-            for (const char* suffix : pbrSuffixes) {
-                buildCompact(suffix);
-            }
-        }
+    }
+    if (saved) {
+        // 法线也按同一 tileSel 合成；缺任意一张就删掉旧 _n，避免基础色 compact
+        // 配到上一轮残留的部分法线图。_s/_a 仍允许缺省。
+        normalWritten = buildCompact("_n");
+        buildCompact("_s");
+        buildCompact("_a");
+    }
+    if (!normalWritten) {
+        DeleteFileW(string_to_wstring(BuildCtmTextureFilePath(ns, baseDir, fileName + "_n")).c_str());
     }
 
     info.saved = saved;
@@ -2708,9 +2831,8 @@ void ApplyCtmToBlockModel(ModelData& model,
                 atlasInfo = &ai;
                 atlasSel = tilePos;
                 useAtlas = true;
-                char buf[8];
-                snprintf(buf, sizeof(buf), "%02d", r.tiles[tilePos]);
-                chainMaterialName = BuildCtmMaterialName(r.ns, r.baseDir, buf);
+                chainMaterialName = BuildCtmMaterialName(r.ns, r.baseDir,
+                    CtmTileStem(r.ns, r.baseDir, r.tiles[tilePos]));
                 return ai.tex;
             }
             return GetOrCreateTileTexInfo(r.ns, r.baseDir, r.tiles[tilePos]);

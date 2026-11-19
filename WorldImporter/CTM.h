@@ -55,6 +55,7 @@ struct CtmRule {
     std::vector<std::string> matchTileNamespaces; // 每个 matchTiles 对应的纹理命名空间
     CtmMethod method = CtmMethod::None;
     std::vector<int> tiles;             // tile 编号列表
+    std::vector<std::string> tileNames; // 与 tiles 平行；非空表示 OptiFine 命名 tile（如 glass_00）
     std::vector<std::string> faces;     // faces 过滤(sides/all/north,...)
     std::string connect;                // connect=block / 空
     int width = 0;                      // repeat 专用: tile 网格宽

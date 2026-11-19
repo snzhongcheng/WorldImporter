@@ -153,7 +153,9 @@ inline void warn(const std::string& message, const std::source_location& source 
 inline void error(const std::string& message, const std::source_location& source = std::source_location::current()) { logger().write("ERROR", message, source); }
 
 // Scoped per-thread context. Never put logging inside the block/vertex hot loop.
-inline thread_local std::string operation_context;
+// MinGW/GCC 14 emits a strong TLS init symbol for an inline thread_local variable in a
+// header, which breaks linking once several TUs include it. Define it once in logutil.cpp.
+extern thread_local std::string operation_context;
 struct Context {
     std::string previous;
     explicit Context(std::string value) : previous(operation_context) {
