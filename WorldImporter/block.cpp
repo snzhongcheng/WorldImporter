@@ -4,6 +4,7 @@
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <locale>
 #include <random>
 #include <sstream>
@@ -676,6 +677,25 @@ NbtTagPtr GetBlockEntityNbt(int blockX, int blockY, int blockZ) {
 }
 
 
+static bool ReadSectionY(const NbtTagPtr& sectionTag, int& outSectionY) {
+    if (!sectionTag || sectionTag->type != TagType::COMPOUND) return false;
+    auto yTag = getChildByName(sectionTag, "Y");
+    if (!yTag) return false;
+    if (yTag->type == TagType::BYTE && !yTag->payload.empty()) {
+        outSectionY = static_cast<int>(bytesToByte(yTag->payload));
+        return true;
+    }
+    if (yTag->type == TagType::SHORT && yTag->payload.size() >= 2) {
+        outSectionY = static_cast<int>(bytesToShort(yTag->payload));
+        return true;
+    }
+    if (yTag->type == TagType::INT && yTag->payload.size() >= 4) {
+        outSectionY = static_cast<int>(bytesToInt(yTag->payload));
+        return true;
+    }
+    return false;
+}
+
 // 修改 LoadAndCacheBlockData,使其处理整个 chunk 的所有子区块
 void LoadAndCacheBlockData(int chunkX, int chunkZ) {
     auto key = std::make_tuple(chunkX, chunkZ, 0);
@@ -713,6 +733,32 @@ void LoadAndCacheBlockData(int chunkX, int chunkZ) {
         if (yPosTag && yPosTag->type == TagType::INT) {
             minSectionY = bytesToInt(yPosTag->payload);
         }
+
+        // 先扫描 sections 的有效方块区段跨度，为破限高世界(如高度 1024/2048/4064)提供精确的高度图位数提示
+        auto sectionsTag = getChildByName(tag, "sections");
+        int minBlockSecY = std::numeric_limits<int>::max();
+        int maxBlockSecY = std::numeric_limits<int>::min();
+        if (sectionsTag && sectionsTag->type == TagType::LIST) {
+            for (const auto& sectionTag : sectionsTag->children) {
+                int secY = 0;
+                if (ReadSectionY(sectionTag, secY) && getChildByName(sectionTag, "block_states")) {
+                    minBlockSecY = std::min(minBlockSecY, secY);
+                    maxBlockSecY = std::max(maxBlockSecY, secY);
+                }
+            }
+        }
+        int heightMapBitsHint = 0;
+        if (minBlockSecY <= maxBlockSecY) {
+            int baseSecY = (yPosTag && yPosTag->type == TagType::INT) ? minSectionY : minBlockSecY;
+            int worldHeight = (maxBlockSecY - baseSecY + 1) * 16;
+            if (worldHeight > 0) {
+                int states = worldHeight + 1;
+                while (heightMapBitsHint < 30 && (1 << heightMapBitsHint) < states) {
+                    ++heightMapBitsHint;
+                }
+            }
+        }
+
         // 处理高度图
         auto heightMapsTag = getChildByName(tag, "Heightmaps");
         if (heightMapsTag && heightMapsTag->type == TagType::COMPOUND) {
@@ -725,7 +771,7 @@ void LoadAndCacheBlockData(int chunkX, int chunkZ) {
                     const int64_t* rawData = reinterpret_cast<const int64_t*>(mapDataTag->payload.data());
                     std::vector<int64_t> longData(rawData, rawData + numLongs);
 
-                    std::vector<int> heights = DecodeHeightMap(longData);
+                    std::vector<int> heights = DecodeHeightMap(longData, heightMapBitsHint);
                     heightMapCache[std::make_pair(chunkX, chunkZ)][mapType] = heights;
                     hmFilled++;
                 }
@@ -746,23 +792,20 @@ void LoadAndCacheBlockData(int chunkX, int chunkZ) {
             ProcessEntityBlocks(chunkX, chunkZ, blockEntitiesTag);
         }
 
-        // 提取所有子区块
-        auto sectionsTag = getChildByName(tag, "sections");
-        if (!sectionsTag || sectionsTag->type != TagType::LIST) {
-            return; // 没有子区块
+        // 遍历所有子区块 (仍在锁内, ProcessSection 内部注册调色板)
+        if (sectionsTag && sectionsTag->type == TagType::LIST) {
+            for (const auto& sectionTag : sectionsTag->children) {
+                int sectionY = 0;
+                if (!ReadSectionY(sectionTag, sectionY)) continue;
+
+                // 处理子区块
+                ProcessSection(chunkX, chunkZ, sectionY, sectionTag);
+            }
         }
 
-        // 遍历所有子区块 (仍在锁内, ProcessSection 内部注册调色板)
-        for (const auto& sectionTag : sectionsTag->children) {
-            int sectionY = -1;
-            auto yTag = getChildByName(sectionTag, "Y");
-
-            if (yTag && yTag->type == TagType::BYTE) {
-                sectionY = static_cast<int>(yTag->payload[0]);
-            }
-
-            // 处理子区块
-            ProcessSection(chunkX, chunkZ, sectionY, sectionTag);
+        // 若该区块未包含 sectionY == 4 (adjustedSectionY == 0)，补入空占位以防后续重复解压解析整个区块
+        if (sectionCache.find(key) == sectionCache.end()) {
+            sectionCache.emplace(key, SectionCacheEntry());
         }
     }
 }

@@ -7,6 +7,7 @@
  * 区域文件(Region File)通常包含32x32个区块的数据，以mca格式存储。
  */
 #pragma once
+#include <cstdint>
 #include <vector>
 
 /**
@@ -25,6 +26,7 @@ std::vector<char> GetChunkNBTData(const std::vector<char>& fileData, int x, int 
  * 高度图数据表示区块中每个列(x,z位置)的最高非空气方块的y坐标
  * 
  * @param data 从NBT数据中提取的原始高度图数据(通常是一组Long值)
+ * @param hintBits 可选的世界高度位数提示(ceil(log2(worldHeight + 1)))，用于区分共享同一数组长度的位宽(如11位与12位均为52个long)
  * @return std::vector<int> 由256个高度值组成的数组，对应区块内16x16个列
  */
-std::vector<int> DecodeHeightMap(const std::vector<int64_t>& data);
+std::vector<int> DecodeHeightMap(const std::vector<int64_t>& data, int hintBits = 0);
